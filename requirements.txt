@@ -1,0 +1,5 @@
+packaging==26.2
+pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm.git
+python-can==4.6.1
+typing_extensions==4.16.0
+wrapt==1.17.3
