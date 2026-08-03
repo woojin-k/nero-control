@@ -52,12 +52,36 @@ def _warning(target: str, before: dict) -> str:
             "중력으로 처질 수 있습니다. 먼저 팔을 받치세요!")
 
 
+def set_mode(robot, target: str, confirm=None):
+    """Switch an already-connected `robot` to `target` ('leader' | 'follower').
+
+    Reusable core for a CLI/GUI. `confirm(message) -> bool` gates the change
+    (default: console y/N); a GUI can inject a popup, or pass ``lambda _: True``
+    to skip. Sends set_leader_mode()/set_follower_mode() only; never enables
+    motors. Returns ``(ok, before_modes, after_modes)`` where after_modes is
+    None if the change was cancelled.
+    """
+    if target not in ("leader", "follower"):
+        raise ValueError("target must be 'leader' or 'follower'")
+    before = cc.read_modes(robot)
+    confirm = confirm or _console_confirm
+    if not confirm(_warning(target, before)):
+        return False, before, None
+    if target == "leader":
+        robot.set_leader_mode()
+    else:
+        robot.set_follower_mode()
+    time.sleep(1.0)  # let the mode settle before reading it back
+    after = cc.read_modes(robot)
+    return True, before, after
+
+
 def switch(target: str, can: str = "can0", fw: str = "v112",
            yes: bool = False) -> int:
-    """Switch the arm to `target` ('leader' | 'follower'). Returns an exit code.
+    """Connect, switch the arm to `target`, verify, disconnect. Returns exit code.
 
-    Read-only until confirmed; then sends set_leader_mode()/set_follower_mode()
-    and reads the mode back to verify. Never enables motors or moves the arm.
+    Thin CLI wrapper around set_mode() that owns the connection; a CLI/GUI with
+    its own shared connection should call set_mode(robot, target, confirm).
     """
     if target not in ("leader", "follower"):
         raise ValueError("target must be 'leader' or 'follower'")
@@ -73,23 +97,16 @@ def switch(target: str, can: str = "can0", fw: str = "v112",
         return 1
 
     try:
-        before = cc.read_modes(robot)
-        print(f"[{tag}] current mode : {cc.format_mode_oneline(before)}")
+        print(f"[{tag}] current mode : {cc.format_mode_oneline(cc.read_modes(robot))}")
         print(f"[{tag}] target mode  : {target}")
 
-        if not yes and not _console_confirm(_warning(target, before)):
+        confirm = (lambda _: True) if yes else None
+        ok, _before, after = set_mode(robot, target, confirm)
+        if not ok:
             print(f"[{tag}] cancelled. 취소되었습니다.")
             return 3
 
-        if target == "leader":
-            robot.set_leader_mode()
-        else:
-            robot.set_follower_mode()
         print(f"[{tag}] sent mode-config: {target}")
-
-        # Verify by reading the mode back.
-        time.sleep(1.0)
-        after = cc.read_modes(robot)
         print(f"[{tag}] mode now     : {cc.format_mode_oneline(after)}")
         print(f"[{tag}] comm ok / fps: {robot.is_ok()} / {robot.get_fps()}")
         return 0
