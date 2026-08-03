@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Runtime data: keep the directory tree, ignore saved contents.
+# waypoints/ is tracked (the folder), but the saved *.json waypoints are not.
+src/data/*
+!src/data/waypoints/
+src/data/waypoints/*
+!src/data/waypoints/.gitkeep
