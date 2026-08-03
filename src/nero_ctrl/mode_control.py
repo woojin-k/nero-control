@@ -44,12 +44,28 @@ def _warning(target: str, before: dict) -> str:
                   "전환됩니다. 먼저 팔을 받치세요!")
         return w
     # target == "leader"
-    return ("[set_leader] switching to LEADER (zero-force drag master). The "
-            "mode-config frame is sent; motors are NOT enabled."
-            "\n[set_leader] !! Entering LEADER: the arm becomes hand-movable / "
-            "backdrivable and may sag under gravity. Support it first!"
-            "\n[set_leader]   !! 리더 진입 — 팔이 손으로 움직이는 무저항 상태가 되어 "
-            "중력으로 처질 수 있습니다. 먼저 팔을 받치세요!")
+    return ("[set_leader] switching to LEADER (zero-force drag master). Motors "
+            "are ENABLED first to release the joint brakes, then the arm is put "
+            "into zero-force drag."
+            "\n[set_leader] !! Entering LEADER: once the brakes release the arm "
+            "becomes hand-movable / backdrivable and may sag under gravity. "
+            "Support it FIRST, before you confirm!"
+            "\n[set_leader]   !! 리더 진입 — 모터를 켜 브레이크를 풀고 무저항 드래그로 "
+            "전환합니다. 브레이크가 풀리면 팔이 손으로 움직이며 중력으로 처질 수 "
+            "있으니, 확인 전에 먼저 팔을 받치세요!")
+
+
+def _enable_with_timeout(robot, timeout=5.0):
+    """Enable all joints (releases the brakes), bounded by `timeout`."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if robot.enable():
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.1)
+    return False
 
 
 def set_mode(robot, target: str, confirm=None):
@@ -57,9 +73,12 @@ def set_mode(robot, target: str, confirm=None):
 
     Reusable core for a CLI/GUI. `confirm(message) -> bool` gates the change
     (default: console y/N); a GUI can inject a popup, or pass ``lambda _: True``
-    to skip. Sends set_leader_mode()/set_follower_mode() only; never enables
-    motors. Returns ``(ok, before_modes, after_modes)`` where after_modes is
-    None if the change was cancelled.
+    to skip. Returns ``(ok, before_modes, after_modes)``; after_modes is None if
+    cancelled or if enabling failed.
+
+    FOLLOWER only sends the mode-config frame (no enable). LEADER (zero-force
+    drag) needs the joint brakes released, so it ENABLES the motors first; if
+    the arm is disabled/braked, set_leader_mode() alone does nothing.
     """
     if target not in ("leader", "follower"):
         raise ValueError("target must be 'leader' or 'follower'")
@@ -68,6 +87,11 @@ def set_mode(robot, target: str, confirm=None):
     if not confirm(_warning(target, before)):
         return False, before, None
     if target == "leader":
+        # Zero-force drag requires the brakes released -> enable first.
+        if not _enable_with_timeout(robot):
+            print("[set_leader] could not enable motors / release brakes — "
+                  "aborting.")
+            return False, before, None
         robot.set_leader_mode()
     else:
         robot.set_follower_mode()
@@ -103,12 +127,22 @@ def switch(target: str, can: str = "can0", fw: str = "v112",
         confirm = (lambda _: True) if yes else None
         ok, _before, after = set_mode(robot, target, confirm)
         if not ok:
-            print(f"[{tag}] cancelled. 취소되었습니다.")
+            print(f"[{tag}] not switched (cancelled or enable failed).")
             return 3
 
         print(f"[{tag}] sent mode-config: {target}")
         print(f"[{tag}] mode now     : {cc.format_mode_oneline(after)}")
         print(f"[{tag}] comm ok / fps: {robot.is_ok()} / {robot.get_fps()}")
+
+        # Verify the switch actually took (leader needs brakes released + drag).
+        role = after.get("linkage_role")
+        if target == "leader" and role != "LEADER":
+            print(f"[{tag}] !! still {role}, not LEADER. If it stays this way, "
+                  "make sure the arm is supported and try again.")
+            return 5
+        if target == "follower" and role == "LEADER":
+            print(f"[{tag}] !! still LEADER — retry.")
+            return 5
         return 0
     finally:
         robot.disconnect()
