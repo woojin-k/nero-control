@@ -28,6 +28,9 @@ import move_to_joints as mj
 import waypoints as wp
 import goto_waypoint as gw
 import check_gripper as cg
+import move_gripper as mg
+import gripper_info as gi
+import ctrl_mode as cm
 
 
 HELP = """\
@@ -37,6 +40,8 @@ commands (one shared connection, one prompt):
   joints               current joint angles (J1..J7)
   mode                 show current mode
   mode follower|leader switch linkage mode (asks y/N)
+  teach                enter drag-teach: arm becomes hand-movable (asks y/N)
+  canmode              exit drag-teach, back to CAN control     (asks y/N)
 
   movep X Y Z R P Y    Cartesian move, mm + deg (MOVE P / IK)   (asks y/N)
   movej J1 .. J7       joint move, 7 values in deg (MOVE J)      (asks y/N)
@@ -47,6 +52,13 @@ commands (one shared connection, one prompt):
   goto <name> [joints|cartesian]   move to a waypoint (asks y/N)
 
   gripper              check if an AGX gripper is connected (read-only)
+  gripper info                  arm fw + gripper params/state (read-only)
+  gripper calib [70|100]        zero-point calibration (close jaws by hand)
+  gripper open|close [forceN]   open fully / close into a grasp
+  gripper to <val> [forceN]     move to width mm / angle deg
+                                (moves enable ALL motors — arm holds pose —
+                                 and ask y/N)
+  gripper reset                 disable + clear gripper errors
 
   help                 show this help
   quit                 exit (motors are left as-is; the arm holds its pose)
@@ -177,7 +189,7 @@ def cmd_points():
         print(f"  {wp.format_waypoint(wp.load_waypoint(name))}")
 
 
-def cmd_gripper(robot, state):
+def cmd_gripper(robot, state, rest):
     # init_effector is one-shot per robot instance, so init lazily and cache it.
     if state.get("effector") is None:
         try:
@@ -186,8 +198,67 @@ def cmd_gripper(robot, state):
         except Exception as exc:  # noqa: BLE001
             print(f"[gripper] init failed: {type(exc).__name__}: {exc}")
             return
-    for line in cg.format_report(cg.check_gripper(state["effector"])):
-        print(line)
+    effector = state["effector"]
+
+    if not rest:                      # bare 'gripper' = read-only check
+        for line in cg.format_report(cg.check_gripper(effector)):
+            print(line)
+        return
+
+    sub = rest[0].lower()
+    if sub == "info":
+        for line in gi.format_info(gi.gripper_info(robot, effector)):
+            print(line)
+        return
+    if sub == "reset":
+        effector.reset_gripper()      # disable + clear errors
+        print("[gripper] reset sent (disabled + errors cleared).")
+        return
+    if sub == "calib":
+        rng = None
+        if len(rest) > 1:
+            if rest[1] not in ("70", "100"):
+                print("usage: gripper calib [70|100]  (stroke in mm)")
+                return
+            rng = int(rest[1]) / 1000.0
+        outcome, param_ok = mg.calibrate(robot, effector, rng)  # y/N + Enter
+        mg.report_calib(outcome, param_ok, tag="gripper")
+        return
+    if sub in ("open", "close"):
+        spec, force_arg = sub, rest[1:]
+    elif sub == "to":
+        if len(rest) < 2:
+            print("usage: gripper to <val> [forceN]")
+            return
+        spec, force_arg = rest[1], rest[2:]
+    else:
+        print("usage: gripper [info|calib|open|close|to <val>|reset] [forceN]")
+        return
+    force = 1.0
+    if force_arg:
+        try:
+            force = float(force_arg[0])
+        except ValueError:
+            print(f"[gripper] invalid force: {force_arg[0]}")
+            return
+
+    mode, chk = mg.read_mode(effector)
+    if mode is None:
+        for line in cg.format_report(chk):
+            print(line)
+        print("[gripper] refusing to command a gripper that shows no "
+              "telemetry.")
+        return
+    target, err = mg.resolve_target(effector, mode, spec)
+    if err:
+        print(f"[gripper] {err}")
+        return
+    cur = chk["status"].msg
+    print(f"[gripper] mode {mode}: {mg.fmt_value(cur.value, mode)} -> "
+          f"{mg.fmt_value(target, mode)} at {force:.2f} N")
+    outcome, msg = mg.move_gripper(robot, effector, mode, target, force,
+                                   state["timeout"])   # console y/N confirm
+    mg.report(outcome, msg, mode, target, state["timeout"], tag="gripper")
 
 
 def cmd_goto(robot, state, rest):
@@ -244,6 +315,12 @@ def repl(robot, state):
             cmd_joints(robot)
         elif head == "mode":
             cmd_mode(robot, rest)
+        elif head == "teach":
+            ok, _b, after = cm.set_ctrl_mode(robot, "teach")   # console y/N
+            cm.report("teach", ok, after)
+        elif head == "canmode":
+            ok, _b, after = cm.set_ctrl_mode(robot, "can")     # console y/N
+            cm.report("can", ok, after)
         elif head == "speed":
             cmd_speed(state, rest)
         elif head == "movep":
@@ -257,7 +334,7 @@ def repl(robot, state):
         elif head == "goto":
             cmd_goto(robot, state, rest)
         elif head == "gripper":
-            cmd_gripper(robot, state)
+            cmd_gripper(robot, state, rest)
         else:
             print(f"unknown command: {head}  (try 'help')")
 
