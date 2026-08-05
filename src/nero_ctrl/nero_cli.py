@@ -94,9 +94,10 @@ def _move_msg(outcome, status):
 
 
 def _auto(state):
-    """Confirm override for the cores: auto-yes during 'seq run', else None
-    (= the core's own console y/N prompt)."""
-    return (lambda _: True) if state.get("auto_yes") else None
+    """Confirm override for the cores: auto-yes during 'seq run', else the
+    frontend's confirm callback (a GUI popup), else None (= the core's own
+    console y/N prompt)."""
+    return (lambda _: True) if state.get("auto_yes") else state.get("confirm")
 
 
 def cmd_status(robot):
@@ -122,7 +123,7 @@ def cmd_joints(robot):
         sj.print_joints(ja, src)
 
 
-def cmd_mode(robot, rest):
+def cmd_mode(robot, state, rest):
     if not rest:
         m = cc.read_modes(robot)
         print(f"[mode] {cc.format_mode_oneline(m)}")
@@ -131,7 +132,7 @@ def cmd_mode(robot, rest):
     if target not in ("follower", "leader"):
         print("usage: mode [follower|leader]")
         return False
-    ok, _before, after = mc.set_mode(robot, target)   # console y/N confirm
+    ok, _before, after = mc.set_mode(robot, target, _auto(state))
     if not ok:
         print("[mode] cancelled.")
         return False
@@ -286,15 +287,16 @@ def cmd_movej(robot, state, rest):
 def cmd_save(robot, rest):
     if not rest:
         print("usage: save <name> [description]")
-        return
+        return False
     name, desc = rest[0], " ".join(rest[1:])
     try:
         _path, existed, rec = wp.capture(robot, name, desc)
     except (ValueError, FileExistsError) as exc:
         print(f"[save] not saved: {exc}")
-        return
+        return False
     verb = "overwrote" if existed else "saved"
     print(f"[save] {verb} '{name}': {wp.format_waypoint(rec)}")
+    return True
 
 
 def cmd_points():
@@ -339,7 +341,8 @@ def cmd_gripper(robot, state, rest):
                 print("usage: gripper calib [70|100]  (stroke in mm)")
                 return False
             rng = int(rest[1]) / 1000.0
-        outcome, param_ok = mg.calibrate(robot, effector, rng)  # y/N + Enter
+        outcome, param_ok = mg.calibrate(robot, effector, rng, _auto(state),
+                                         state.get("interact"))
         mg.report_calib(outcome, param_ok, tag="gripper")
         return outcome == "calibrated"
     if sub in ("open", "close"):
@@ -524,7 +527,8 @@ def cmd_seq(robot, state, rest):
         print(f"[seq] '{rest[1]}' — {len(steps)} steps:")
         for i, step in enumerate(steps, start=1):
             print(f"  {i:2d}. {step}")
-        if not mp._console_confirm(
+        confirm = _auto(state) or mp._console_confirm
+        if not confirm(
                 "[seq] !! ALL steps will run SEQUENTIALLY with every move "
                 "AUTO-CONFIRMED (the arm and gripper move without further "
                 "prompts). It stops at the first failed step.\n"
@@ -572,12 +576,12 @@ def dispatch(robot, state, line):
         else:
             cmd_joints(robot)
     elif head == "mode":
-        ok = cmd_mode(robot, rest)
+        ok = cmd_mode(robot, state, rest)
     elif head == "teach":
-        done, _b, after = cm.set_ctrl_mode(robot, "teach")     # console y/N
+        done, _b, after = cm.set_ctrl_mode(robot, "teach", _auto(state))
         ok = cm.report("teach", done, after) == 0
     elif head == "canmode":
-        done, _b, after = cm.set_ctrl_mode(robot, "can")       # console y/N
+        done, _b, after = cm.set_ctrl_mode(robot, "can", _auto(state))
         ok = cm.report("can", done, after) == 0
     elif head == "speed":
         ok = cmd_speed(state, rest)
@@ -588,7 +592,7 @@ def dispatch(robot, state, line):
     elif head == "movej":
         ok = cmd_movej(robot, state, rest)
     elif head == "save":
-        cmd_save(robot, rest)
+        ok = cmd_save(robot, rest)
     elif head == "points":
         cmd_points()
     elif head == "goto":
@@ -653,7 +657,8 @@ def main():
         raise SystemExit(1)
     print(f"[nero_cli] connected on {args.can}.")
     state = {"speed": max(1, min(args.speed, 100)), "timeout": 15.0,
-             "effector": None, "auto_yes": False, "seq_rec": None}
+             "effector": None, "auto_yes": False, "seq_rec": None,
+             "confirm": None, "interact": None}
     try:
         repl(robot, state)
     finally:
