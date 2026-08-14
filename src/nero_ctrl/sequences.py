@@ -36,8 +36,8 @@ _SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SEQUENCES_DIR = os.path.join(_SRC_DIR, "data", "sequences")
 
 # Command heads a sequence step may start with (checked before running).
-ALLOWED_HEADS = ("movep", "movej", "joints", "goto", "gripper", "sleep",
-                 "speed")
+ALLOWED_HEADS = ("movep", "movel", "movej", "joints", "goto", "gripper",
+                 "sleep", "speed")
 
 
 def _now():
@@ -67,7 +67,7 @@ def is_recordable(line):
     if not tokens:
         return False
     head = tokens[0].lower()
-    if head in ("movep", "movej", "goto", "sleep", "speed"):
+    if head in ("movep", "movel", "movej", "goto", "sleep", "speed"):
         return len(tokens) > 1
     if head == "joints":                     # only 'joints rel …' moves
         return len(tokens) > 1 and tokens[1].lower() == "rel"

@@ -18,6 +18,10 @@ NO_SOLUTION / SINGULARITY_POINT / TARGET_POS_EXCEEDS_LIMIT means the target is
 unreachable and the arm does not move. (If a Cartesian target is rejected, a
 joint-space move can still reach poses IK refuses.)
 
+With --linear the arm uses MOVE L instead: the flange travels in a straight
+line to the same target. Every point on the line must be reachable, so MOVE L
+can reject targets a plain MOVE P would accept.
+
 The arm must be in FOLLOWER / normal control mode (not LEADER). This script does
 NOT disable the motors afterwards, so the arm holds its pose; do not leave it
 unattended enabled.
@@ -130,7 +134,8 @@ def _fmt_pose(pose):
             f"{math.degrees(yaw):+.1f}) deg")
 
 
-def move_to_pose(robot, target, speed=20, timeout=15.0, confirm=None):
+def move_to_pose(robot, target, speed=20, timeout=15.0, confirm=None,
+                 linear=False):
     """Move the flange to `target` via MOVE P / IK on a connected `robot`.
 
     Reusable core for a CLI/GUI: takes an already-connected driver and the
@@ -140,6 +145,10 @@ def move_to_pose(robot, target, speed=20, timeout=15.0, confirm=None):
     `confirm(message) -> bool` gates the enable + move (default: console y/N).
     A GUI can inject a popup-based confirm; pass ``lambda _: True`` to skip the
     prompt. Motors are NOT disabled afterwards (the arm holds its pose).
+
+    ``linear=True`` uses MOVE L instead of MOVE P: the flange travels in a
+    straight line to the target (same pose format). The whole line must be
+    reachable, so MOVE L rejects targets MOVE P would accept.
 
     Returns ``(outcome, arm_status)`` where outcome is one of:
       "invalid" (out of range), "leader" (wrong mode), "cancelled",
@@ -155,7 +164,10 @@ def move_to_pose(robot, target, speed=20, timeout=15.0, confirm=None):
     if not enable_with_timeout(robot):
         return "enable_failed", None
     robot.set_speed_percent(speed)
-    robot.move_p(target)          # sets MOVE P mode internally, sends the IK cmd
+    if linear:
+        robot.move_l(target)      # sets MOVE L mode internally (straight line)
+    else:
+        robot.move_p(target)      # sets MOVE P mode internally, sends the IK cmd
     return watch_motion(robot, timeout)
 
 
@@ -176,6 +188,8 @@ def _parse_args():
                         "mm + degrees")
     p.add_argument("--speed", type=int, default=20,
                    help="move speed percent 1-100 (default: 20, kept low)")
+    p.add_argument("--linear", action="store_true",
+                   help="use MOVE L (straight-line path) instead of MOVE P")
     p.add_argument("--timeout", type=float, default=15.0,
                    help="seconds to wait for the motion to finish")
     p.add_argument("--yes", action="store_true",
@@ -210,11 +224,13 @@ def main():
         if cur is not None:
             print(f"[move] current : {_fmt_pose(cur)}   ({cur_src})")
         print(f"[move] target  : {_fmt_pose(target)}")
-        print(f"[move] speed   : {args.speed}%   mode: MOVE P (Cartesian IK)")
+        mode = ("MOVE L (linear path)" if args.linear
+                else "MOVE P (Cartesian IK)")
+        print(f"[move] speed   : {args.speed}%   mode: {mode}")
 
         confirm = (lambda _: True) if args.yes else None
         outcome, status = move_to_pose(robot, target, args.speed, args.timeout,
-                                       confirm)
+                                       confirm, linear=args.linear)
 
         if outcome == "leader":
             print("[move] arm is in LEADER (zero-force drag) mode — cannot do a "

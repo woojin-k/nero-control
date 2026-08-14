@@ -11,7 +11,10 @@ Which method:
   * joints    (default when the waypoint has joints) — MOVE J, no IK. Reliably
     reproduces the exact captured posture, even where Cartesian IK would fail.
   * cartesian (default only if the waypoint has no joints) — MOVE P via IK.
-Force one with --joints or --cartesian.
+  * linear    (only when forced with --linear) — MOVE L: the flange travels a
+    straight line to the waypoint's Cartesian pose; the whole path must be
+    reachable, so it can reject targets MOVE P would accept.
+Force one with --joints, --cartesian, or --linear.
 
 Usage:
     ./.venv/bin/python src/nero_ctrl/goto_waypoint.py --name home
@@ -31,13 +34,17 @@ import move_to_joints as mj
 
 
 def _choose_method(record, want):
-    """Pick 'joints' or 'cartesian' for this waypoint. Returns (method, error)."""
+    """Pick 'joints' / 'cartesian' / 'linear' for this waypoint.
+
+    Returns (method, error). 'linear' is never chosen by auto — the straight-
+    line path is a deliberate request (it can reject reachable targets).
+    """
     has_j = record.get("joints_deg") is not None
     has_c = record.get("cartesian") is not None
     if want == "joints":
         return ("joints", None) if has_j else (None, "waypoint has no joints")
-    if want == "cartesian":
-        return ("cartesian", None) if has_c else (None, "waypoint has no cartesian pose")
+    if want in ("cartesian", "linear"):
+        return (want, None) if has_c else (None, "waypoint has no cartesian pose")
     # auto: prefer joints (exact, IK-free), else cartesian
     if has_j:
         return "joints", None
@@ -60,6 +67,8 @@ def _parse_args():
                    help="force joint-space move (MOVE J)")
     g.add_argument("--cartesian", action="store_true",
                    help="force Cartesian move (MOVE P / IK)")
+    g.add_argument("--linear", action="store_true",
+                   help="force straight-line Cartesian move (MOVE L)")
     p.add_argument("--speed", type=int, default=20,
                    help="move speed percent 1-100 (default: 20, kept low)")
     p.add_argument("--timeout", type=float, default=15.0,
@@ -93,7 +102,8 @@ def main():
         print(f"[goto] no waypoint named '{args.name}'. use --list to see saved ones.")
         raise SystemExit(2)
 
-    want = "joints" if args.joints else "cartesian" if args.cartesian else "auto"
+    want = ("joints" if args.joints else "cartesian" if args.cartesian
+            else "linear" if args.linear else "auto")
     method, err = _choose_method(record, want)
     if err:
         print(f"[goto] {err}: '{args.name}'.")
@@ -124,7 +134,8 @@ def main():
         else:
             target = wp.to_cartesian_target(record)
             outcome, status = mp.move_to_pose(robot, target, args.speed,
-                                              args.timeout, confirm)
+                                              args.timeout, confirm,
+                                              linear=(method == "linear"))
             code = _report_cartesian(outcome, status, args.timeout)
 
         # show where the arm ended up

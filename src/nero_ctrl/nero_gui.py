@@ -315,7 +315,7 @@ class NeroGui:
         pl = ("X mm", "Y mm", "Z mm", "R°", "P°", "Y°")
         jl = tuple(f"J{i + 1}°" for i in range(7))
 
-        f1 = ttk.LabelFrame(tab, text="movep — 절대 위치 (mm / deg)")
+        f1 = ttk.LabelFrame(tab, text="movep / movel — 절대 위치 (mm / deg)")
         f1.pack(fill="x", padx=6, pady=4)
         row = ttk.Frame(f1)
         row.pack(fill="x", padx=4, pady=2)
@@ -323,16 +323,24 @@ class NeroGui:
         btns = ttk.Frame(f1)
         btns.pack(fill="x", padx=4, pady=(0, 4))
         self._btn(btns, "현재 자세 채우기", self._fill_pose).pack(side="left")
-        self._danger_btn(btns, "이동", self._do_movep).pack(side="left", padx=4)
+        self._danger_btn(btns, "이동 (movep)", self._do_movep)\
+            .pack(side="left", padx=4)
+        self._danger_btn(btns, "직선 이동 (movel)",
+                         lambda: self._do_movep(linear=True)).pack(side="left")
 
-        f2 = ttk.LabelFrame(tab, text="movep rel — 상대 이동 (비우면/0이면 유지)")
+        f2 = ttk.LabelFrame(tab, text="movep / movel rel — 상대 이동 "
+                                      "(비우면/0이면 유지)")
         f2.pack(fill="x", padx=6, pady=4)
         row = ttk.Frame(f2)
         row.pack(fill="x", padx=4, pady=2)
         self.movep_rel_vars = self._entries(row, pl, defaults=["0"] * 6)
         b = ttk.Frame(f2)
         b.pack(fill="x", padx=4, pady=(0, 4))
-        self._danger_btn(b, "상대 이동", self._do_movep_rel).pack(side="left")
+        self._danger_btn(b, "상대 이동 (movep)", self._do_movep_rel)\
+            .pack(side="left")
+        self._danger_btn(b, "상대 직선 (movel)",
+                         lambda: self._do_movep_rel(linear=True))\
+            .pack(side="left", padx=4)
 
         f3 = ttk.LabelFrame(tab, text="movej — 절대 관절 (deg)")
         f3.pack(fill="x", padx=6, pady=4)
@@ -368,7 +376,7 @@ class NeroGui:
         ttk.Separator(right).pack(fill="x", pady=4)
         ttk.Label(right, text="이동 방식").pack(anchor="w")
         self.goto_method = ttk.Combobox(
-            right, values=("auto", "joints", "cartesian"), width=10,
+            right, values=("auto", "joints", "cartesian", "linear"), width=10,
             state="readonly")
         self.goto_method.set("auto")
         self.goto_method.pack(fill="x")
@@ -482,14 +490,16 @@ class NeroGui:
     def _vals(self, svars):
         return [v.get().strip() for v in svars]
 
-    def _do_movep(self):
-        self.run_cmd("movep " + " ".join(self._vals(self.movep_vars)))
+    def _do_movep(self, linear=False):
+        head = "movel" if linear else "movep"
+        self.run_cmd(f"{head} " + " ".join(self._vals(self.movep_vars)))
 
-    def _do_movep_rel(self):
+    def _do_movep_rel(self, linear=False):
+        head = "movel" if linear else "movep"
         vals = [v or "0" for v in self._vals(self.movep_rel_vars)]
         if vals[3:] == ["0", "0", "0"]:
             vals = vals[:3]           # keep current orientation
-        self.run_cmd("movep rel " + " ".join(vals))
+        self.run_cmd(f"{head} rel " + " ".join(vals))
 
     def _do_movej(self):
         self.run_cmd("movej " + " ".join(self._vals(self.movej_vars)))

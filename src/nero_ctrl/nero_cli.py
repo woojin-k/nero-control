@@ -48,13 +48,16 @@ commands (one shared connection, one prompt):
   movep X Y Z R P Y    Cartesian move, mm + deg (MOVE P / IK)   (asks y/N)
   movep rel DX DY DZ [DR DP DY]   relative Cartesian move, mm + deg;
                        R P Y omitted = keep current orientation  (asks y/N)
+  movel ...            same as movep (abs/rel) but MOVE L: the flange travels
+                       a STRAIGHT LINE — whole path must be reachable (asks y/N)
   movej J1 .. J7       joint move, 7 values in deg (MOVE J)      (asks y/N)
   movej rel D1 .. D7   relative joint move, 7 deltas in deg      (asks y/N)
   speed [pct]          show / set move speed % for this session (default 20)
 
   save <name> [desc]   capture current posture -> waypoint (both parts)
   points               list saved waypoints
-  goto <name> [joints|cartesian]   move to a waypoint (asks y/N)
+  goto <name> [joints|cartesian|linear]   move to a waypoint (asks y/N;
+                       linear = MOVE L straight-line to its cartesian pose)
 
   gripper              check if an AGX gripper is connected (read-only)
   gripper info                  arm fw + gripper params/state (read-only)
@@ -178,19 +181,20 @@ def _wrap_pi(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
-def cmd_movep_rel(robot, state, rest):
+def cmd_movep_rel(robot, state, rest, linear=False):
+    tag = "movel" if linear else "movep"
     if len(rest) not in (3, 6):
-        print("usage: movep rel DX DY DZ [DR DP DY]  (mm, deg; "
+        print(f"usage: {tag} rel DX DY DZ [DR DP DY]  (mm, deg; "
               "R P Y omitted = keep current orientation)")
         return False
     try:
         deltas = [float(x) for x in rest]
     except ValueError:
-        print(f"[movep] invalid numbers: {' '.join(rest)}")
+        print(f"[{tag}] invalid numbers: {' '.join(rest)}")
         return False
     cur, src = sp.read_pose(robot)
     if cur is None:
-        print("[movep] cannot read the current pose — a relative move needs "
+        print(f"[{tag}] cannot read the current pose — a relative move needs "
               "it (parser mismatch?)")
         return False
     target = list(cur)
@@ -204,13 +208,14 @@ def cmd_movep_rel(robot, state, rest):
         target[5] = _wrap_pi(target[5] + math.radians(deltas[5]))
     errs = mp.validate_target(target)
     if errs:
-        print("[movep] resulting target out of range: " + "; ".join(errs))
+        print(f"[{tag}] resulting target out of range: " + "; ".join(errs))
         return False
-    print(f"[movep] current: {mp._fmt_pose(cur)}   ({src})")
-    print(f"[movep] target : {mp._fmt_pose(target)}")
+    print(f"[{tag}] current: {mp._fmt_pose(cur)}   ({src})")
+    print(f"[{tag}] target : {mp._fmt_pose(target)}")
     outcome, status = mp.move_to_pose(robot, target, state["speed"],
-                                      state["timeout"], _auto(state))
-    print(f"[movep] {_move_msg(outcome, status)}")
+                                      state["timeout"], _auto(state),
+                                      linear=linear)
+    print(f"[{tag}] {_move_msg(outcome, status)}")
     return outcome == "reached"
 
 
@@ -245,25 +250,27 @@ def cmd_movej_rel(robot, state, rest):
     return outcome == "reached"
 
 
-def cmd_movep(robot, state, rest):
+def cmd_movep(robot, state, rest, linear=False):
+    tag = "movel" if linear else "movep"
     if rest and rest[0].lower() == "rel":
-        return cmd_movep_rel(robot, state, rest[1:])
+        return cmd_movep_rel(robot, state, rest[1:], linear=linear)
     if len(rest) != 6:
-        print("usage: movep X Y Z ROLL PITCH YAW  (mm, deg)")
+        print(f"usage: {tag} X Y Z ROLL PITCH YAW  (mm, deg)")
         return False
     try:
         vals = [float(x) for x in rest]
     except ValueError:
-        print(f"[movep] invalid numbers: {' '.join(rest)}")
+        print(f"[{tag}] invalid numbers: {' '.join(rest)}")
         return False
     target = mp.build_target(vals, si=False)      # mm/deg -> native m/rad
     errs = mp.validate_target(target)
     if errs:
-        print("[movep] out of range: " + "; ".join(errs))
+        print(f"[{tag}] out of range: " + "; ".join(errs))
         return False
     outcome, status = mp.move_to_pose(robot, target, state["speed"],
-                                      state["timeout"], _auto(state))
-    print(f"[movep] {_move_msg(outcome, status)}")
+                                      state["timeout"], _auto(state),
+                                      linear=linear)
+    print(f"[{tag}] {_move_msg(outcome, status)}")
     return outcome == "reached"
 
 
@@ -386,7 +393,7 @@ def cmd_gripper(robot, state, rest):
 
 def cmd_goto(robot, state, rest):
     if not rest:
-        print("usage: goto <name> [joints|cartesian]")
+        print("usage: goto <name> [joints|cartesian|linear]")
         return False
     name = rest[0]
     try:
@@ -395,8 +402,8 @@ def cmd_goto(robot, state, rest):
         print(f"[goto] no waypoint '{name}' (try 'points')")
         return False
     want = rest[1].lower() if len(rest) > 1 else "auto"
-    if want not in ("auto", "joints", "cartesian"):
-        print("usage: goto <name> [joints|cartesian]")
+    if want not in ("auto", "joints", "cartesian", "linear"):
+        print("usage: goto <name> [joints|cartesian|linear]")
         return False
     method, err = gw._choose_method(rec, want)
     if err:
@@ -410,7 +417,8 @@ def cmd_goto(robot, state, rest):
     else:
         outcome, status = mp.move_to_pose(robot, wp.to_cartesian_target(rec),
                                           state["speed"], state["timeout"],
-                                          _auto(state))
+                                          _auto(state),
+                                          linear=(method == "linear"))
     print(f"[goto] {_move_msg(outcome, status)}")
     return outcome == "reached"
 
@@ -589,6 +597,8 @@ def dispatch(robot, state, line):
         ok = cmd_sleep(rest)
     elif head == "movep":
         ok = cmd_movep(robot, state, rest)
+    elif head == "movel":
+        ok = cmd_movep(robot, state, rest, linear=True)
     elif head == "movej":
         ok = cmd_movej(robot, state, rest)
     elif head == "save":
