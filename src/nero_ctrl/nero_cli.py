@@ -31,6 +31,7 @@ import goto_waypoint as gw
 import check_gripper as cg
 import move_gripper as mg
 import gripper_info as gi
+import gripper_range as gr
 import ctrl_mode as cm
 import sequences as sq
 
@@ -61,8 +62,12 @@ commands (one shared connection, one prompt):
 
   gripper              check if an AGX gripper is connected (read-only)
   gripper info                  arm fw + gripper params/state (read-only)
-  gripper calib [70|100]        zero-point calibration (close jaws by hand)
-  gripper open|close [forceN]   open fully / close into a grasp
+  gripper calib                 teach the travel by hand: fully-closed end
+                                (this also sets zero), then fully-open end.
+                                Do this after changing/modifying the jaws
+  gripper calib zero [70|100]   zero point only (the old behaviour)
+  gripper range [clear]         show / delete the taught travel (read-only)
+  gripper open|close [forceN]   go to the taught open / closed end
   gripper to <val> [forceN]     move to width mm / angle deg
                                 (moves enable ALL motors — arm holds pose —
                                  and ask y/N)
@@ -328,30 +333,64 @@ def cmd_gripper(robot, state, rest):
     effector = state["effector"]
 
     if not rest:                      # bare 'gripper' = read-only check
-        for line in cg.format_report(cg.check_gripper(effector)):
+        # `state` doubles as the detection latch: a disabled gripper parked on
+        # its zero point reports all-zero, same as no gripper at all.
+        for line in cg.format_report(cg.check_gripper(effector, latch=state)):
             print(line)
         return True
 
     sub = rest[0].lower()
     if sub == "info":
-        for line in gi.format_info(gi.gripper_info(robot, effector)):
+        for line in gi.format_info(gi.gripper_info(robot, effector,
+                                                   latch=state)):
             print(line)
         return True
     if sub == "reset":
         effector.reset_gripper()      # disable + clear errors
         print("[gripper] reset sent (disabled + errors cleared).")
         return True
+    if sub == "range":
+        if len(rest) > 1 and rest[1].lower() == "clear":
+            if gr.clear_range():
+                print("[gripper] taught range deleted — 'open'/'close' fall "
+                      "back to the teaching-pendant stroke.")
+            else:
+                print("[gripper] no taught range to delete.")
+            return True
+        for line in gr.format_range(gr.load_range(), tag="gripper"):
+            print(line)
+        return True
     if sub == "calib":
-        rng = None
+        # Default: teach BOTH ends by hand (right for modified/changed jaws).
+        # 'calib zero [70|100]' keeps the old zero-point-only behaviour.
+        if len(rest) > 1 and rest[1].lower() == "zero":
+            rng = None
+            if len(rest) > 2:
+                if rest[2] not in ("70", "100"):
+                    print("usage: gripper calib zero [70|100]  (stroke in mm)")
+                    return False
+                rng = int(rest[2]) / 1000.0
+            outcome, param_ok = mg.calibrate(robot, effector, rng,
+                                             _auto(state),
+                                             state.get("interact"))
+            mg.report_calib(outcome, param_ok, tag="gripper")
+            return outcome == "calibrated"
         if len(rest) > 1:
-            if rest[1] not in ("70", "100"):
-                print("usage: gripper calib [70|100]  (stroke in mm)")
-                return False
-            rng = int(rest[1]) / 1000.0
-        outcome, param_ok = mg.calibrate(robot, effector, rng, _auto(state),
-                                         state.get("interact"))
-        mg.report_calib(outcome, param_ok, tag="gripper")
-        return outcome == "calibrated"
+            print("usage: gripper calib            (teach both ends by hand)\n"
+                  "       gripper calib zero [70|100]   (zero point only)")
+            return False
+        mode, chk = mg.read_mode(effector, latch=state)
+        if mode is None:
+            for line in cg.format_report(chk):
+                print(line)
+            print("[gripper] refusing to teach a gripper that shows no "
+                  "telemetry.")
+            return False
+        outcome, rec, param_ok = mg.teach_range(robot, effector, mode,
+                                                _auto(state),
+                                                state.get("interact"))
+        mg.report_teach(outcome, rec, param_ok, tag="gripper")
+        return outcome == "taught"
     if sub in ("open", "close"):
         spec, force_arg = sub, rest[1:]
     elif sub == "to":
@@ -360,7 +399,8 @@ def cmd_gripper(robot, state, rest):
             return False
         spec, force_arg = rest[1], rest[2:]
     else:
-        print("usage: gripper [info|calib|open|close|to <val>|reset] [forceN]")
+        print("usage: gripper [info|calib|range|open|close|to <val>|reset] "
+              "[forceN]")
         return False
     force = 1.0
     if force_arg:
@@ -370,20 +410,27 @@ def cmd_gripper(robot, state, rest):
             print(f"[gripper] invalid force: {force_arg[0]}")
             return False
 
-    mode, chk = mg.read_mode(effector)
+    mode, chk = mg.read_mode(effector, latch=state)
     if mode is None:
         for line in cg.format_report(chk):
             print(line)
         print("[gripper] refusing to command a gripper that shows no "
               "telemetry.")
         return False
-    target, err = mg.resolve_target(effector, mode, spec)
+    rec = gr.load_range(mode=mode)
+    target, err = mg.resolve_target(effector, mode, spec, rec)
     if err:
         print(f"[gripper] {err}")
         return False
-    cur = chk["status"].msg
-    print(f"[gripper] mode {mode}: {mg.fmt_value(cur.value, mode)} -> "
-          f"{mg.fmt_value(target, mode)} at {force:.2f} N")
+    if chk.get("latched") or chk["status"] is None:
+        # Telemetry is all-zero (parked on zero, disabled) — no meaningful
+        # "from" value to show, but the target is still valid.
+        print(f"[gripper] mode {mode}: -> {mg.fmt_value(target, mode)} at "
+              f"{force:.2f} N")
+    else:
+        cur = chk["status"].msg
+        print(f"[gripper] mode {mode}: {mg.fmt_value(cur.value, mode)} -> "
+              f"{mg.fmt_value(target, mode)} at {force:.2f} N")
     outcome, msg = mg.move_gripper(robot, effector, mode, target, force,
                                    state["timeout"], _auto(state))
     mg.report(outcome, msg, mode, target, state["timeout"], tag="gripper")

@@ -429,17 +429,27 @@ class NeroGui:
             .pack(side="left", padx=2)
         self._danger_btn(row2, "이동", self._grip_to).pack(side="left", padx=2)
 
-        r3 = ttk.LabelFrame(tab, text="영점 캘리브레이션 (조를 손으로 닫고 진행)")
+        r3 = ttk.LabelFrame(tab, text="캘리브레이션 (손으로 양 끝을 잡아 티칭 — "
+                                      "모터로 움직이지 않음)")
         r3.pack(fill="x", padx=6, pady=4)
         row = ttk.Frame(r3)
         row.pack(fill="x", padx=4, pady=4)
-        ttk.Label(row, text="스트로크 mm").pack(side="left")
-        self.calib_range = ttk.Combobox(row, values=("(유지)", "70", "100"),
+        self._danger_btn(row, "범위 캘리 (닫힘→열림)",
+                         self._do_calib).pack(side="left", padx=2)
+        self._btn(row, "저장된 범위 보기",
+                  lambda: self.run_cmd("gripper range")).pack(side="left",
+                                                              padx=2)
+        ttk.Label(row, text="조를 개조/교체했으면 범위 캘리를 다시")\
+            .pack(side="left", padx=6)
+        row2 = ttk.Frame(r3)
+        row2.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Label(row2, text="영점만 (구 방식)  스트로크 mm").pack(side="left")
+        self.calib_range = ttk.Combobox(row2, values=("(유지)", "70", "100"),
                                         width=6, state="readonly")
         self.calib_range.set("(유지)")
         self.calib_range.pack(side="left", padx=4)
-        self._danger_btn(row, "캘리브레이션", self._do_calib).pack(side="left",
-                                                            padx=2)
+        self._danger_btn(row2, "영점 캘리", self._do_calib_zero)\
+            .pack(side="left", padx=2)
         return tab
 
     def _tab_sequences(self, nb):
@@ -597,9 +607,12 @@ class NeroGui:
         self.run_cmd(f"gripper to {val}" + (f" {force}" if force else ""))
 
     def _do_calib(self):
+        self.run_cmd("gripper calib")
+
+    def _do_calib_zero(self):
         rng = self.calib_range.get()
-        self.run_cmd("gripper calib" + (f" {rng}" if rng in ("70", "100")
-                                        else ""))
+        self.run_cmd("gripper calib zero" + (f" {rng}" if rng in ("70", "100")
+                                             else ""))
 
     def _seq_sel(self, prefix):
         name = self._sel(self.seq_list)

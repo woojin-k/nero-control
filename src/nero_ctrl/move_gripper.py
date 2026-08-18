@@ -25,8 +25,17 @@ A freshly mounted / power-cycled gripper is NOT homed (0x2A8 bit7 = 0): it
 enables fine but ignores position commands. Run --calib once — the jaws are
 closed by hand and that position is stored as zero (0xAE + 0x476 ack).
 
+--calib fixes only the CLOSED end. The OPEN end comes from the teaching-pendant
+param, i.e. the gripper's FACTORY stroke, which is wrong for a gripper with
+modified jaw tips: thicker tips meet early, so the new zero sits part-way up the
+factory scale, 'open' aims past the physical end stop, and the stalled resend
+trips the driver (the gripper then drops off the CAN bus). --teach solves that
+without measuring anything: with the motor disabled you set BOTH ends by hand and
+the encoder readings are stored (see gripper_range.py). Prefer --teach.
+
 Usage:
-    ./.venv/bin/python src/nero_ctrl/move_gripper.py --calib           # first!
+    ./.venv/bin/python src/nero_ctrl/move_gripper.py --teach           # first!
+    ./.venv/bin/python src/nero_ctrl/move_gripper.py --calib     # zero end only
     ./.venv/bin/python src/nero_ctrl/move_gripper.py --open
     ./.venv/bin/python src/nero_ctrl/move_gripper.py --close
     ./.venv/bin/python src/nero_ctrl/move_gripper.py --to 30 --force 2
@@ -42,6 +51,7 @@ import time
 import connect_check as cc
 import move_to_pose as mp
 import check_gripper as cg
+import gripper_range as gr
 
 # Convergence tolerances in the gripper's native units.
 TOL_WIDTH_M = 0.002     # 2 mm on a 70/100 mm stroke
@@ -65,17 +75,22 @@ WARN_CALIB = ("[grip] Zero-point calibration: the gripper will be DISABLED, "
               "완전히 닫은 뒤 그 위치가 영점이 됩니다.")
 
 
-def read_mode(effector, window=0.6):
+def read_mode(effector, window=0.6, latch=None):
     """Detect the gripper and its mode from live 0x2A8 telemetry. Read-only.
 
     Returns ``(mode, check_result)`` where mode is "width"/"angle", or
     ``(None, check_result)`` when no real gripper telemetry is present (same
     criterion as check_gripper.py: all-zero frames are the arm's placeholder).
+    `latch` is passed straight through to check_gripper(), so a gripper parked
+    on its zero point still resolves to its remembered mode instead of reading
+    as disconnected.
     """
-    res = cg.check_gripper(effector, window)
+    res = cg.check_gripper(effector, window, latch=latch)
     if not res["detected"]:
         return None, res
-    return res["status"].msg.mode, res
+    # On a latched (all-zero) window the placeholder frame's decoded mode is
+    # meaningless — check_gripper hands back the remembered one.
+    return res.get("mode") or res["status"].msg.mode, res
 
 
 def max_width_m(effector):
@@ -89,26 +104,47 @@ def max_width_m(effector):
     return DEFAULT_MAX_WIDTH_M
 
 
-def resolve_target(effector, mode, spec):
+def resolve_target(effector, mode, spec, rec=None):
     """Turn a CLI target spec into native units for `mode`.
 
     `spec` is "open", "close", or a number string — mm in width mode, deg in
-    angle mode. Returns ``(target, err)``; on error target is None.
+    angle mode. `rec` is a hand-taught range record (gripper_range); when None
+    it is loaded for `mode`, and when there is none the factory teaching-pendant
+    stroke is used as before. A taught record is authoritative: it defines both
+    the 'open'/'close' targets and the accepted numeric range, which is what
+    keeps a modified-tip gripper off its end stops.
+
+    Returns ``(target, err)``; on error target is None.
     """
+    if rec is None:
+        rec = gr.load_range(mode=mode)
+
     if spec == "close":
-        return 0.0, None
+        return (gr.close_target(rec) if rec else 0.0), None
     if spec == "open":
+        if rec:
+            return gr.open_target(rec), None
         if mode == "angle":
-            return None, ("gripper is in ANGLE mode — full-open angle is not "
-                          "known; give an explicit angle (deg)")
+            return None, ("gripper is in ANGLE mode and no range is taught — "
+                          "full-open angle is not known; run 'gripper calib' "
+                          "or give an explicit angle (deg)")
         return max_width_m(effector), None
+
     try:
         v = float(spec)
     except (TypeError, ValueError):
         return None, f"invalid target: {spec}"
+    t = v if mode == "angle" else v / 1000.0    # CLI mm -> native m
+    if rec:
+        lo, hi = gr.limits(rec)
+        tol = TOL_ANGLE_DEG if mode == "angle" else TOL_WIDTH_M
+        if not lo - tol <= t <= hi + tol:
+            return None, (f"target {gr.fmt(t, mode)} outside the taught range "
+                          f"[{gr.fmt(lo, mode)}, {gr.fmt(hi, mode)}] — "
+                          "re-teach with 'gripper calib' if the jaws changed")
+        return t, None
     if mode == "angle":
-        return v, None
-    t = v / 1000.0                      # CLI mm -> native m
+        return t, None
     limit = max_width_m(effector)
     if not 0.0 <= t <= limit + 0.005:
         return None, (f"width {v:.1f} mm out of range "
@@ -229,6 +265,10 @@ def calibrate(robot, effector, max_range_m=None, confirm=None, interact=None):
     """Zero-point calibration: disable, let the user close the jaws by hand,
     then set that position as zero (0xAE). Reusable core for a CLI/GUI.
 
+    This fixes the CLOSED end only; the open end stays whatever the pendant
+    param claims. For anything but stock jaws prefer teach_range(), which sets
+    both ends and cannot aim past the real travel.
+
     A gripper that is not homed (0x2A8 bit7 = 0) ignores position commands, so
     this must run once after mounting/power-cycling the gripper. `max_range_m`
     (0.07 or 0.1) optionally stores the gripper's physical stroke first.
@@ -303,6 +343,139 @@ def report_calib(outcome, param_ok=None, tag="grip"):
     return 6
 
 
+WARN_TEACH = ("[grip] Range teach: the gripper will be DISABLED, then you set "
+              "BOTH ends by hand — fully closed first (that becomes zero), "
+              "then fully open. Nothing is driven by the motor.\n"
+              "[grip]   범위 티칭: 그리퍼가 비활성화되면 손으로 (1) 완전히 닫은 "
+              "위치, (2) 완전히 열린 위치를 차례로 잡아 주세요. 모터로 "
+              "움직이지 않습니다.")
+
+PROMPT_CLOSED = ("[grip] 1/2 — close the jaws FULLY by hand, then press Enter. "
+                 "손으로 조를 완전히 닫고 Enter: ")
+PROMPT_OPEN = ("[grip] 2/2 — open the jaws FULLY by hand, then press Enter. "
+               "손으로 조를 완전히 열고 Enter: ")
+
+
+def _settle_value(effector, mode, tries=15, poll=0.08):
+    """Read the jaw value once telemetry stops changing. Read-only.
+
+    Returns the settled native value, or None if no frame ever arrived. Waiting
+    for it to stop moving matters here: the user has just let go of the jaws.
+    """
+    tol = TOL_ANGLE_DEG if mode == "angle" else TOL_WIDTH_M
+    last = None
+    stable = 0
+    for _ in range(tries):
+        time.sleep(poll)
+        gs = effector.get_gripper_status()
+        if gs is None:
+            continue
+        v = gs.msg.value
+        if last is not None and abs(v - last) < tol / 20:
+            stable += 1
+            if stable >= 3:
+                return v
+        else:
+            stable = 0
+        last = v
+    return last
+
+
+def teach_range(robot, effector, mode, confirm=None, interact=None, note=""):
+    """Teach the gripper's real travel by hand: closed end, then open end.
+
+    Built for jaws that cannot reach the factory scale — modified/thicker tips.
+    The motor stays DISABLED throughout, so nothing can be driven into an end
+    stop; the human defines both limits and only the encoder is read.
+
+    Step 1 doubles as the zero-point calibration (0xAE) the firmware needs
+    before it will accept position commands at all, so this replaces
+    calibrate(). The closed reading is recorded as measured rather than assumed
+    to be 0 — on firmware that silently ignores the zero-set, the taught pair is
+    still self-consistent and the targets still land in the right place.
+
+    `confirm(msg) -> bool` gates the whole thing; `interact(msg) -> bool` pauses
+    for each end. Returns ``(outcome, rec, param_ok)`` with outcome one of
+    "leader", "cancelled", "no_telemetry", "no_span", "taught". `rec` is the
+    gripper_range record (returned even for "no_span", unsaved, so the caller
+    can show what was read). `param_ok` is whether the measured stroke was
+    stored to the teaching-pendant param (None when not attempted) — a failed
+    store is not fatal, the local record is what the CLI actually uses.
+    """
+    if cc.read_modes(robot).get("linkage_role") == "LEADER":
+        return "leader", None, None
+    confirm = confirm or mp._console_confirm
+    if not confirm(WARN_TEACH):
+        return "cancelled", None, None
+    ensure_can_ctrl(robot)     # teaching-input mode swallows config/zero acks
+    effector.disable_gripper()
+    interact = interact or _console_pause
+
+    if not interact(PROMPT_CLOSED):
+        return "cancelled", None, None
+    effector.calibrate_gripper(timeout=2.0)   # this position becomes zero
+    # calibrate_gripper may leave the driver enabled; disable again so the jaws
+    # stay free for step 2 instead of fighting the hand that opens them.
+    effector.disable_gripper()
+    closed = _settle_value(effector, mode)
+    if closed is None:
+        return "no_telemetry", None, None
+
+    if not interact(PROMPT_OPEN):
+        return "cancelled", None, None
+    opened = _settle_value(effector, mode)
+    if opened is None:
+        return "no_telemetry", None, None
+
+    rec = gr.make_range(mode, closed, opened, note=note)
+    if gr.span(rec) < gr.min_span(mode):
+        return "no_span", rec, None
+    gr.save_range(rec)
+
+    param_ok = None
+    if mode == "width":
+        # Keep the pendant's stroke in step with reality too, so any code path
+        # still falling back to max_width_m() cannot aim past the end stop.
+        try:
+            param_ok = effector.set_gripper_teaching_pendant_param(
+                max_range_config=round(gr.span(rec), 4))
+        except Exception:  # noqa: BLE001
+            param_ok = False
+    return "taught", rec, param_ok
+
+
+def report_teach(outcome, rec, param_ok=None, tag="grip"):
+    """Print a teach_range() outcome and return the process exit code."""
+    if outcome == "leader":
+        print(f"[{tag}] arm is in LEADER mode — run set_follower_mode.py "
+              "first.")
+        return 2
+    if outcome == "cancelled":
+        print(f"[{tag}] cancelled — nothing stored. 취소되었습니다.")
+        return 3
+    if outcome == "no_telemetry":
+        print(f"[{tag}] no gripper telemetry while teaching — check the "
+              "gripper's power/CAN link and retry.")
+        return 6
+    if outcome == "no_span":
+        mode = rec.get("mode", "width")
+        print(f"[{tag}] the two ends read almost the same "
+              f"({gr.fmt(rec['closed'], mode)} -> {gr.fmt(rec['open'], mode)}) "
+              f"— nothing stored. Did the jaws actually move between the two "
+              "prompts? 두 위치가 거의 같습니다 — 저장하지 않았습니다.")
+        return 6
+    if param_ok is False:
+        print(f"[{tag}] warning: measured stroke not stored to the pendant "
+              "param (no ACK) — harmless, the taught range file is what is "
+              "used.")
+    for line in gr.format_range(rec, tag=tag):
+        print(line)
+    print(f"[{tag}] taught and saved to {gr.RANGE_PATH}")
+    print(f"[{tag}] 'open'/'close' now aim at the taught ends, and targets "
+          "outside them are refused — no more driving into an end stop.")
+    return 0
+
+
 def _not_homed_hint(msg, tag):
     if msg is not None and not msg.foc_status.homing_status:
         print(f"[{tag}] note: homed bit is 0. If the value telemetry does not "
@@ -354,14 +527,18 @@ def _parse_args():
                    help="firmware/parser of this arm (default: v112)")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--open", action="store_true",
-                   help="open fully (teaching-pendant max range)")
+                   help="open fully (taught open end, else pendant max range)")
     g.add_argument("--close", action="store_true",
-                   help="close fully (0) — stalls into a grasp on an object")
+                   help="close fully (taught closed end, else 0) — stalls into "
+                        "a grasp on an object")
     g.add_argument("--to", type=float, metavar="VALUE",
                    help="target: mm in width mode / deg in angle mode")
+    g.add_argument("--teach", action="store_true",
+                   help="teach the real travel by hand: closed end (also sets "
+                        "zero), then open end — use this for modified jaws")
     g.add_argument("--calib", action="store_true",
-                   help="zero-point calibration (close jaws by hand when "
-                        "asked) — required once before position commands work")
+                   help="zero-point calibration only (close jaws by hand when "
+                        "asked); --teach does this and the open end too")
     g.add_argument("--reset", action="store_true",
                    help="disable + clear gripper errors")
     p.add_argument("--range", type=int, choices=(70, 100), default=None,
@@ -409,6 +586,11 @@ def main():
                       f"homed={m.foc_status.homing_status}")
             raise SystemExit(0)
 
+        if args.teach:
+            confirm = (lambda _: True) if args.yes else None
+            outcome, rec, param_ok = teach_range(robot, effector, mode, confirm)
+            raise SystemExit(report_teach(outcome, rec, param_ok))
+
         if args.calib:
             confirm = (lambda _: True) if args.yes else None
             rng = args.range / 1000.0 if args.range else None
@@ -416,7 +598,8 @@ def main():
             code = report_calib(outcome, param_ok)
             raise SystemExit(code)
 
-        target, err = resolve_target(effector, mode, spec)
+        rec = gr.load_range(mode=mode)
+        target, err = resolve_target(effector, mode, spec, rec)
         if err:
             print(f"[grip] {err}")
             raise SystemExit(2)
@@ -424,6 +607,9 @@ def main():
         cur = chk["status"].msg
         print(f"[grip] mode   : {mode}   current: {fmt_value(cur.value, mode)}"
               f"   force: {cur.force:.2f} N")
+        if rec:
+            print(f"[grip] range  : taught closed={fmt_value(rec['closed'], mode)}"
+                  f"  open={fmt_value(rec['open'], mode)}")
         print(f"[grip] target : {fmt_value(target, mode)}   "
               f"force: {args.force:.2f} N")
 

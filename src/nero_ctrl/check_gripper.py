@@ -19,6 +19,14 @@ Caveat: an all-zero result means "no gripper OR a gripper that is attached but
 unpowered/off" — an unpowered gripper reports nothing either way. A powered,
 functional gripper always reports non-zero telemetry.
 
+One real gripper DOES read all-zero, though: a disabled gripper parked exactly
+at its zero point (value 0, no force, no fault bits) is bit-for-bit identical to
+the placeholder frame. That is the normal state right after a zero-point
+calibration, so `detected` would flip to False on a perfectly healthy gripper.
+For that case a caller may pass a `latch` dict (e.g. the CLI's session state):
+once real telemetry has been seen through that latch, a later all-zero window is
+reported as detected-by-latch instead of as a disconnect.
+
 Reads only; never enables the gripper or moves anything.
 
 Usage:
@@ -41,15 +49,22 @@ def _status_is_real(msg):
     return bool(msg.value) or bool(msg.force) or bool(sc)
 
 
-def check_gripper(effector, window=1.2, poll=0.05):
+def check_gripper(effector, window=1.2, poll=0.05, latch=None):
     """Detect the AGX gripper from its 0x2A8 telemetry, over `window` seconds.
 
     Takes an already-initialized gripper `effector` (robot.init_effector(...)).
-    Read-only. Returns a result dict:
-      detected  : bool  -- any non-zero telemetry seen (a real powered gripper)
+    Read-only. `latch`, if given, is a mutable dict that remembers real
+    telemetry across calls within a session (see the module docstring): keys
+    "gripper_seen" and "gripper_mode" are written on a real detection and read
+    back when a window comes up all-zero.
+
+    Returns a result dict:
+      detected  : bool  -- real telemetry seen, or vouched for by the latch
+      latched   : bool  -- detected only because the latch had seen it before
       samples   : int   -- gripper-status reads that returned a frame
       nonzero   : int   -- of those, how many carried non-zero data
       status    : the last non-zero status message (or the last frame), or None
+      mode      : "width"/"angle" from real telemetry (latched when all-zero)
       fps       : effector.get_fps()
     """
     samples = nonzero = 0
@@ -64,11 +79,25 @@ def check_gripper(effector, window=1.2, poll=0.05):
                 nonzero += 1
                 last_real = gs
         time.sleep(poll)
+
+    mode = last_real.msg.mode if last_real is not None else None
+    if nonzero > 0 and latch is not None:
+        latch["gripper_seen"] = True
+        latch["gripper_mode"] = mode
+    # All-zero, but this session already proved a gripper is there: a disabled
+    # gripper sitting on its zero point looks exactly like the placeholder.
+    latched = bool(nonzero == 0 and samples > 0 and latch is not None
+                   and latch.get("gripper_seen"))
+    if latched:
+        mode = latch.get("gripper_mode") or mode
+
     return {
-        "detected": nonzero > 0,
+        "detected": nonzero > 0 or latched,
+        "latched": latched,
         "samples": samples,
         "nonzero": nonzero,
         "status": last_real or last_any,
+        "mode": mode,
         "fps": effector.get_fps(),
     }
 
@@ -80,6 +109,18 @@ def format_report(res):
         lines.append("[gripper] NO status frames on 0x2A8 "
                      f"(fps={res['fps']}). No gripper-channel activity — check "
                      "the CAN link / firmware.")
+        return lines
+
+    if res.get("latched"):
+        lines.append(f"[gripper] DETECTED (latched) — 0x2A8 is all-zero right "
+                     f"now across {res['samples']} samples, but real telemetry "
+                     "was seen earlier this session.")
+        lines.append("[gripper]   That is what a DISABLED gripper parked on its "
+                     "zero point looks like (value 0, no force, no faults) — "
+                     "normal right after a calibration.")
+        lines.append(f"[gripper]   mode={res.get('mode') or '?'}  "
+                     f"fps={res['fps']}. Move the jaws by hand to see live "
+                     "values again.")
         return lines
 
     if res["detected"]:

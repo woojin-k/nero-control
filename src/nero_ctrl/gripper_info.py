@@ -24,13 +24,16 @@ import argparse
 
 import connect_check as cc
 import check_gripper as cg
+import gripper_range as gr
 
 
-def gripper_info(robot, effector, window=1.0):
+def gripper_info(robot, effector, window=1.0, latch=None):
     """Collect arm-firmware + gripper telemetry/params. Read-only.
 
     Returns a dict: arm_fw (str|None), check (check_gripper result),
-    param (dict|None: range_per/max_range_m/friction), param_answers (bool).
+    param (dict|None: range_per/max_range_m/friction), param_answers (bool),
+    range (the hand-taught range record, or None). `latch` is passed to
+    check_gripper() so a gripper parked on its zero point is not misreported.
     """
     arm_fw = None
     try:
@@ -42,7 +45,7 @@ def gripper_info(robot, effector, window=1.0):
     except Exception:  # noqa: BLE001
         pass
 
-    chk = cg.check_gripper(effector, window)
+    chk = cg.check_gripper(effector, window, latch=latch)
 
     param = None
     try:
@@ -57,7 +60,8 @@ def gripper_info(robot, effector, window=1.0):
         }
 
     return {"arm_fw": arm_fw, "check": chk, "param": param,
-            "param_answers": param is not None}
+            "param_answers": param is not None,
+            "range": gr.load_range(mode=chk.get("mode"))}
 
 
 def format_info(info):
@@ -72,6 +76,14 @@ def format_info(info):
     if not chk["detected"]:
         lines.append("[info] gripper        : NOT DETECTED (0x2A8 all-zero — "
                      "not connected or unpowered)")
+        lines.extend(gr.format_range(info.get("range"), tag="info"))
+        return lines
+
+    if chk.get("latched"):
+        lines.append(f"[info] gripper        : DETECTED (latched) — telemetry "
+                     f"all-zero right now, i.e. disabled and parked on zero; "
+                     f"mode={chk.get('mode') or '?'}  fps={chk['fps']}")
+        lines.extend(gr.format_range(info.get("range"), tag="info"))
         return lines
 
     m = chk["status"].msg
@@ -99,6 +111,7 @@ def format_info(info):
                      f"  friction={p['friction']}   (0x477->0x47E answers: OK)")
     else:
         lines.append("[info] pendant params : NO answer to the 0x477 enquiry")
+    lines.extend(gr.format_range(info.get("range"), tag="info"))
     lines.append("[info] fingerprints   : homed bit + 0x476 set-ACKs are not "
                  "implemented on this unit — zero-set/config apply silently")
     return lines
