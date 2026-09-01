@@ -69,15 +69,18 @@ def read_current_joints(node: Node, topic: str, timeout: float = 5.0):
     return None
 
 
-def to_joint_trajectory(q, t):
+def to_joint_trajectory(q, t, v=None, acc=None):
     jt = JointTrajectory()
     jt.joint_names = JOINTS
-    v = np.gradient(q, t, axis=0) if len(q) > 2 else np.zeros_like(q)
-    v[0] = v[-1] = 0.0
-    for qi, vi, ti in zip(q, v, t):
+    if v is None:
+        v = np.gradient(q, t, axis=0) if len(q) > 2 else np.zeros_like(q)
+        v[0] = v[-1] = 0.0
+    for i, (qi, vi, ti) in enumerate(zip(q, v, t)):
         pt = JointTrajectoryPoint()
         pt.positions = [float(x) for x in qi]
         pt.velocities = [float(x) for x in vi]
+        if acc is not None:
+            pt.accelerations = [float(x) for x in acc[i]]
         pt.time_from_start.sec = int(ti)
         pt.time_from_start.nanosec = int((ti % 1.0) * 1e9)
         jt.points.append(pt)
@@ -106,7 +109,7 @@ def execute_moveit(node: Node, jt: JointTrajectory) -> bool:
     return code == 1
 
 
-def preview(node: Node, q, t):
+def preview(node: Node, q, t, v=None, acc=None):
     """Send the plan to RViz's MotionPlanning display via display_planned_path.
 
     The "Planned Path" sub-display animates it once (tick Loop Animation to
@@ -116,7 +119,7 @@ def preview(node: Node, q, t):
     pub = node.create_publisher(DisplayTrajectory, "display_planned_path", 1)
     msg = DisplayTrajectory()
     rt = RobotTrajectory()
-    rt.joint_trajectory = to_joint_trajectory(q, t)
+    rt.joint_trajectory = to_joint_trajectory(q, t, v, acc)
     msg.trajectory.append(rt)
     msg.trajectory_start.joint_state.name = JOINTS
     msg.trajectory_start.joint_state.position = [float(x) for x in q[0]]
@@ -147,25 +150,76 @@ def exec_allowed(node: Node, args) -> bool:
     return True
 
 
+def plan_carry(qj, p_tgt, qdot_max, R_t, t_t):
+    """Joint-interpolated reorientation to the carrying pose (gripper down,
+    container-up = tcp -x). p_tgt None = reorient in place. NOT level-
+    constrained — never do this while holding liquid. Returns
+    (qs, ts, tilt0, dq) or None when the pose has no IK solution."""
+    R_cur, p_cur, _, _ = lp.fk_tcp(qj[None], R_t, t_t)
+    R_cur, p_cur = R_cur[0], p_cur[0]
+    if p_tgt is None:
+        p_tgt = p_cur
+    # the tool axis is tcp +x (at home it points along the arm);
+    # carrying = gripper down, so -x_tcp must point up
+    a = np.array([-1.0, 0.0, 0.0])
+    if (R_cur @ a) @ lp.UP < -0.999:          # antiparallel: level() has
+        R_cur = R_cur @ lp.rot_axis(           # no unique axis — pre-tip
+            np.array([0.0, 1.0, 0.0]), np.pi / 2)   # 90 deg about y
+    R_tgt, tilt0 = lp.level(R_cur, a)
+    q_goal, ok = lp.ik_tcp(R_tgt, np.asarray(p_tgt, float), q_seed=qj,
+                           R_t=R_t, t_t=t_t)
+    if not ok:
+        return None
+    dq = float(np.abs(q_goal - qj).max())
+    T = max(2.0, 2.0 * dq / qdot_max)
+    n = max(2, int(T * 10))
+    s = np.linspace(0.0, 1.0, n)[:, None]
+    qs = qj[None] * (1 - s) + q_goal[None] * s
+    ts = np.linspace(0.0, T, n)
+    return qs, ts, tilt0, dq
+
+
 def make_plan(node: Node, q_start, p_goal, R_goal, args):
-    """Plan, time-parameterize, log and save. Returns (q, t) or None."""
+    """Plan, time-parameterize (TOPP-RA, falling back to the trapezoidal
+    profile), log and save. Returns (q, t, qd, qdd) or None; qd/qdd are None
+    on the fallback path."""
     plan = lp.plan_level_move_auto(
         q_start, p_goal, R_goal, lift=args.lift, step=args.step,
         tcp_xyz=tuple(args.tcp_xyz), tcp_rpy=tuple(args.tcp_rpy))
     if not plan["ok"]:
         node.get_logger().error("planning FAILED — see messages above")
         return None
-    t = lp.time_parameterize(plan["s"], plan["q"], v_max=args.v,
-                             a_max=args.a, qdot_max=args.qdot)
+    retimed = lp.retime_toppra(plan["q"], plan["s"], v_max=args.v,
+                               a_max=args.a, qdot_max=args.qdot,
+                               qddot_max=args.qddot)
+    if retimed is not None:
+        t, q, qd, qdd = retimed
+        # verify the resampled spline still keeps the container level
+        R_t, t_t = lp.tcp_transform(args.tcp_xyz, args.tcp_rpy)
+        R, _, _, _ = lp.fk_tcp(q, R_t, t_t)
+        a_up = R[0].T @ lp.UP
+        tilt = np.arccos(np.clip(
+            np.einsum("nij,j->ni", R, a_up) @ lp.UP, -1.0, 1.0))
+        timing = (f"toppra, max joint rate "
+                  f"{np.abs(qd).max():.2f} rad/s, sampled-path tilt "
+                  f"{np.rad2deg(tilt.max()):.3f} deg")
+    else:
+        node.get_logger().warn("toppra unavailable/failed — trapezoidal timing")
+        q = plan["q"]
+        t = lp.time_parameterize(plan["s"], q, v_max=args.v,
+                                 a_max=args.a, qdot_max=args.qdot)
+        qd = qdd = None
+        timing = "trapezoidal"
     node.get_logger().info(
-        f"plan: {len(plan['q'])} waypoints, {t[-1]:.1f} s, lift "
+        f"plan: {len(plan['q'])} waypoints, {t[-1]:.1f} s ({timing}), lift "
         f"{plan['lift']:.3f} m, max tilt "
         f"{np.rad2deg(max(plan['tilt_err'].max(), plan['tilt_mid'].max())):.3f} deg")
     os.makedirs(OUT, exist_ok=True)
-    np.savez_compressed(args.save, q=plan["q"], t=t, p_ref=plan["p_ref"],
+    np.savez_compressed(args.save, q=q, t=t,
+                        q_wp=plan["q"], s_wp=plan["s"], p_ref=plan["p_ref"],
                         yaw_ref=plan["yaw_ref"], tilt=plan["tilt_err"])
     node.get_logger().info(f"saved {args.save}")
-    return plan["q"], t
+    return q, t, qd, qdd
 
 
 INTERACTIVE_HELP = """\
@@ -179,7 +233,7 @@ commands:
                          NOT level-constrained; do this before grabbing
   preview  (p)           show the last plan in RViz (Planned Path display)
   exec     (go)          execute the last plan on the robot (asks first)
-  set NAME VALUE         tune lift/step/v/a/qdot       e.g.  set lift 0.1
+  set NAME VALUE         tune lift/step/v/a/qdot/qddot e.g.  set lift 0.1
   help     (?)           show this text
   quit     (q)           leave"""
 
@@ -222,31 +276,17 @@ def interactive(node: Node, args):
             if qj is None:
                 print(f"no JointState on '{args.joint_states}'")
                 continue
-            R_cur, p_cur, _, _ = lp.fk_tcp(qj[None], R_t, t_t)
-            R_cur, p_cur = R_cur[0], p_cur[0]
             p_tgt = np.array([float(x) for x in toks[1:]]) if len(toks) == 4 \
-                else p_cur
-            # the tool axis is tcp +x (at home it points along the arm);
-            # carrying = gripper down, so -x_tcp must point up
-            a = np.array([-1.0, 0.0, 0.0])
-            if (R_cur @ a) @ lp.UP < -0.999:      # antiparallel: level() has
-                R_cur = R_cur @ lp.rot_axis(       # no unique axis — pre-tip
-                    np.array([0.0, 1.0, 0.0]), np.pi / 2)   # 90 deg about y
-            R_tgt, tilt0 = lp.level(R_cur, a)
-            q_goal, ok = lp.ik_tcp(R_tgt, p_tgt, q_seed=qj, R_t=R_t, t_t=t_t)
-            if not ok:
+                else None
+            carry = plan_carry(qj, p_tgt, args.qdot, R_t, t_t)
+            if carry is None:
                 print("no IK solution for the carry pose there — the spot "
                       "may be out of reach with the gripper pointing down; "
                       "try 'carry x y z' somewhere closer to the base")
                 continue
-            dq = float(np.abs(q_goal - qj).max())
-            T = max(2.0, 2.0 * dq / args.qdot)
-            n = max(2, int(T * 10))
-            s = np.linspace(0.0, 1.0, n)[:, None]
-            qs = qj[None] * (1 - s) + q_goal[None] * s
-            ts = np.linspace(0.0, T, n)
+            qs, ts, tilt0, dq = carry
             print(f"carry: reorient {np.rad2deg(tilt0):.1f} deg, largest "
-                  f"joint move {np.rad2deg(dq):.1f} deg, {T:.1f} s "
+                  f"joint move {np.rad2deg(dq):.1f} deg, {ts[-1]:.1f} s "
                   "(unconstrained joint move — don't do this holding liquid)")
             if not exec_allowed(node, args):
                 continue
@@ -262,8 +302,8 @@ def interactive(node: Node, args):
             continue
         if cmd == "set" and len(toks) == 3:
             name = toks[1].lower()
-            if name not in ("lift", "step", "v", "a", "qdot"):
-                print("set takes: lift step v a qdot")
+            if name not in ("lift", "step", "v", "a", "qdot", "qddot"):
+                print("set takes: lift step v a qdot qddot")
                 continue
             try:
                 setattr(args, name, float(toks[2]))
@@ -334,9 +374,11 @@ def main():
     ap.add_argument("--lift", type=float, default=0.08)
     ap.add_argument("--step", type=float, default=0.005)
     ap.add_argument("--v", type=float, default=0.06, help="max speed [m/s]")
-    ap.add_argument("--a", type=float, default=0.05, help="max accel [m/s^2]")
+    ap.add_argument("--a", type=float, default=0.2, help="max accel [m/s^2]")
     ap.add_argument("--qdot", type=float, default=1.0,
                     help="max joint rate [rad/s]")
+    ap.add_argument("--qddot", type=float, default=3.0,
+                    help="max joint acceleration [rad/s^2] (toppra timing)")
     ap.add_argument("--tcp-xyz", type=float, nargs=3, default=(0, 0, 0))
     ap.add_argument("--tcp-rpy", type=float, nargs=3, default=(0, 0, 0))
     ap.add_argument("--real", action="store_true",
@@ -413,13 +455,13 @@ def main():
     planned = make_plan(node, q_start, p_goal, R_goal, args)
     if planned is None:
         return
-    q_path, t = planned
+    q_path, t, qd, qdd = planned
 
     if args.execute:
         if exec_allowed(node, args):
-            execute_moveit(node, to_joint_trajectory(q_path, t))
+            execute_moveit(node, to_joint_trajectory(q_path, t, qd, qdd))
     elif args.preview:
-        preview(node, q_path, t)
+        preview(node, q_path, t, qd, qdd)
     else:
         node.get_logger().info("plan-only mode (use --execute or --preview)")
     node.destroy_node()

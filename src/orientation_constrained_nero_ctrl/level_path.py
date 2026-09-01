@@ -353,8 +353,10 @@ def plan_level_move(q_start, p_goal, R_goal=None, *, u=UP, lift=0.08,
     d_yaw = yaw_between(R_s, R_g, u)
     p_g = np.asarray(p_goal, float)
 
-    # fail fast if the goal pose itself has no in-limits IK solution
-    _, goal_ok = ik_tcp(R_g, p_g, q_seed=q_start, R_t=R_t, t_t=t_t)
+    # fail fast if the goal pose itself has no in-limits IK solution; keep the
+    # config — it doubles as a null-space attractor so the redundancy drifts
+    # toward the landing configuration early instead of unwinding at the end
+    q_goal_cfg, goal_ok = ik_tcp(R_g, p_g, q_seed=q_start, R_t=R_t, t_t=t_t)
     if not goal_ok:
         wit = _witnesses(R_t, t_t)
         hint = ""
@@ -385,15 +387,19 @@ def plan_level_move(q_start, p_goal, R_goal=None, *, u=UP, lift=0.08,
     inserted = 0
     jumps = []
     fail = None
+    q_mid = 0.5 * (nk.JOINT_LIMITS[:, 0] + nk.JOINT_LIMITS[:, 1])
     for k in range(1, n):
         R_ref = rot_axis(u, yaw_ref[k]) @ R_s
         last = k == n - 1
         w_k = 1.0 if last else float(w[k])
         q_prev = out_q[-1]
+        # null-space attractor: mid-range at the start blending into the goal
+        # config, so redundant joints pre-align instead of bunching up late
+        attract_k = q_mid + _smoothstep(t_norm[k]) * (q_goal_cfg - q_mid)
         q_sol, pe, te, ye = solve_pose(
             q_prev[None], p_ref[k][None], R_ref, w_yaw=w_k,
             u=u, iters=150 if last else 40, R_t=R_t, t_t=t_t,
-            pos_tol=pos_tol, ang_tol=tilt_tol)
+            pos_tol=pos_tol, ang_tol=tilt_tol, attract=attract_k)
         if pe[0] > pos_tol or te[0] > tilt_tol or (last and ye[0] > yaw_tol):
             # The marched branch died (pinched off, or landing needs a
             # different branch) — find a config for this waypoint globally,
@@ -448,7 +454,7 @@ def plan_level_move(q_start, p_goal, R_goal=None, *, u=UP, lift=0.08,
                 q_re, pe, te, ye = solve_pose(
                     q_prev[None], p_ref[k][None], R_ref, w_yaw=w_k, u=u,
                     iters=150 if last else 60, R_t=R_t, t_t=t_t,
-                    pos_tol=pos_tol, ang_tol=tilt_tol)
+                    pos_tol=pos_tol, ang_tol=tilt_tol, attract=attract_k)
                 if (pe[0] <= pos_tol and te[0] <= tilt_tol
                         and not (last and ye[0] > yaw_tol)):
                     q_sol = q_re
@@ -605,6 +611,58 @@ def time_parameterize(s, q, v_max=0.06, a_max=0.05, qdot_max=1.0):
     dt = np.diff(t)
     need = np.abs(np.diff(q, axis=0)).max(axis=1) / qdot_max
     return np.concatenate([[0.0], np.cumsum(np.maximum(dt, need))])
+
+
+def retime_toppra(q, s_cart, v_max=0.06, a_max=0.2, qdot_max=1.0,
+                  qddot_max=3.0, dt=0.1):
+    """TOPP-RA retiming of a waypoint path: the fastest timing that keeps
+    every joint under (qdot_max, qddot_max) AND the tcp under (v_max, a_max)
+    everywhere along the path — velocity stays continuous, so no acceleration
+    spikes like time_parameterize's per-interval floors.
+
+    The tcp limit rides along as an 8th path coordinate (the cartesian arc
+    length s_cart), so both joint-space and task-space bounds live in one
+    joint-limits constraint.
+
+    Returns (t, q, qd, qdd) sampled every dt seconds, or None if toppra is
+    unavailable or the instance fails (caller should fall back to
+    time_parameterize)."""
+    try:
+        import logging
+        import toppra as ta
+        logging.getLogger("toppra").setLevel(logging.ERROR)
+    except Exception:       # not just ImportError: numpy-ABI errors etc.
+        return None
+    q = np.asarray(q, float)
+    if len(q) < 3:
+        return None
+    # path parameter: joint-space arc length, nudged strictly increasing
+    # (null-walk stretches hold the tcp still, so s_cart alone can stall)
+    step = np.linalg.norm(np.diff(q, axis=0), axis=1)
+    ss = np.concatenate([[0.0], np.cumsum(np.maximum(step, 1e-6))])
+    q_ext = np.column_stack([q, np.asarray(s_cart, float)])
+    path = ta.SplineInterpolator(ss, q_ext)
+    vlim = np.array([[-qdot_max, qdot_max]] * 7 + [[-v_max, v_max]])
+    alim = np.array([[-qddot_max, qddot_max]] * 7 + [[-a_max, a_max]])
+    try:
+        inst = ta.algorithm.TOPPRA(
+            [ta.constraint.JointVelocityConstraint(vlim),
+             ta.constraint.JointAccelerationConstraint(alim)], path)
+        traj = inst.compute_trajectory(0.0, 0.0)
+    except Exception:
+        return None
+    if traj is None:
+        return None
+    t = np.arange(0.0, traj.duration, dt)
+    if traj.duration - t[-1] > 1e-6:
+        t = np.append(t, traj.duration)
+    qs = traj(t)[:, :7]
+    qd = traj(t, 1)[:, :7]
+    qdd = traj(t, 2)[:, :7]
+    qd[0] = qd[-1] = 0.0
+    # pin the sampled endpoints to the exact planned poses
+    qs[0], qs[-1] = q[0], q[-1]
+    return t, qs, qd, qdd
 
 
 # --- self-test ----------------------------------------------------------------
