@@ -15,8 +15,12 @@ through MoveIt, previews it in RViz, or just saves it.
     python3 move_level.py --goal -0.31 -0.15 0.55
     # goal with explicit orientation (quaternion, base_link, xyzw):
     python3 move_level.py --goal -0.31 -0.15 0.55 0.507 -0.492 0.492 0.507
-    # or as a yaw change (deg, about world up) relative to the start:
+    # or with an absolute yaw (deg about world up; 0 = the gripper-down
+    # orientation of the arm stretched straight along base +Z):
     python3 move_level.py --goal -0.31 -0.15 0.55 --goal-yaw 45
+    # plane-to-plane: ONE straight line from the current pose (no lift);
+    # same y z as now = purely vertical height change:
+    python3 move_level.py --goal -0.10 -0.15 0.55 --profile straight
     # actions (default is plan + save only):
     python3 move_level.py --goal ... --preview    # RViz Planned Path display
     python3 move_level.py --goal ... --execute    # MoveIt /execute_trajectory
@@ -37,6 +41,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import level_path as lp  # noqa: E402
+import nero_kinematics as nk  # noqa: E402
 
 import rclpy  # noqa: E402
 from rclpy.node import Node  # noqa: E402
@@ -170,52 +175,146 @@ def plan_carry(qj, p_tgt, qdot_max, R_t, t_t):
                            R_t=R_t, t_t=t_t)
     if not ok:
         return None
+    qs, ts, dq = _joint_interp(qj, q_goal, qdot_max)
+    return qs, ts, tilt0, dq
+
+
+def _joint_interp(qj, q_goal, qdot_max):
+    """Straight joint-space interpolation qj -> q_goal at <= qdot_max/2,
+    never faster than 2 s. Returns (qs, ts, dq_max)."""
     dq = float(np.abs(q_goal - qj).max())
     T = max(2.0, 2.0 * dq / qdot_max)
     n = max(2, int(T * 10))
     s = np.linspace(0.0, 1.0, n)[:, None]
     qs = qj[None] * (1 - s) + q_goal[None] * s
     ts = np.linspace(0.0, T, n)
-    return qs, ts, tilt0, dq
+    return qs, ts, dq
 
 
-def make_plan(node: Node, q_start, p_goal, R_goal, args):
-    """Plan, time-parameterize (TOPP-RA, falling back to the trapezoidal
-    profile), log and save. Returns (q, t, qd, qdd) or None; qd/qdd are None
-    on the fallback path."""
-    plan = lp.plan_level_move_auto(
-        q_start, p_goal, R_goal, lift=args.lift, step=args.step,
-        tcp_xyz=tuple(args.tcp_xyz), tcp_rpy=tuple(args.tcp_rpy))
+SAGITTAL_FREE = (1, 3, 6)          # joint2, joint4, joint7 (0-based indices)
+
+
+def plan_sagittal_carry(qj, x_plane, z_tgt, qdot_max, R_t, t_t):
+    """Joint-interpolated move to the canonical in-plane carry pose: joints
+    1/3/5/6 at zero (the arm folded in the base X-Z plane, no sideways
+    yaw), joints 2/4/7 solved so the tcp sits at height x_plane, at z_tgt
+    along base +Z, with the gripper pointing straight down (level carry
+    orientation, container-up = tcp -x). NOT level-constrained on the way —
+    only the final pose is level. Returns (qs, ts, q_goal, p_goal, dq) or
+    None when no in-limits solution reaches (x_plane, z_tgt)."""
+    from scipy.optimize import least_squares
+    lo, hi = nk.JOINT_LIMITS[:, 0], nk.JOINT_LIMITS[:, 1]
+    free = list(SAGITTAL_FREE)
+    a = np.array([-1.0, 0.0, 0.0])            # container-up in the tcp frame
+
+    def resid(v):
+        q = np.zeros(7)
+        q[free] = v
+        R, p, _, _ = lp.fk_tcp(q[None], R_t, t_t)
+        up = R[0] @ a
+        return [p[0][0] - x_plane, p[0][2] - z_tgt, up[1], up[2]]
+
+    sols = []
+    for j2 in np.linspace(lo[1], hi[1], 6):
+        for j4 in np.linspace(lo[3], hi[3], 6):
+            j7 = np.clip(np.pi / 2 - j2 - j4, lo[6], hi[6])
+            r = least_squares(resid, [j2, j4, j7],
+                              bounds=(lo[free], hi[free]))
+            if r.cost < 1e-9 and not any(
+                    np.abs(r.x - s).max() < 1e-3 for s in sols):
+                sols.append(r.x)
+    if not sols:
+        return None
+    # several elbow branches may reach: take the one nearest the current pose
+    v = min(sols, key=lambda s: np.abs(s - qj[free]).max())
+    q_goal = np.zeros(7)
+    q_goal[free] = v
+    _, p_goal, _, _ = lp.fk_tcp(q_goal[None], R_t, t_t)
+    qs, ts, dq = _joint_interp(qj, q_goal, qdot_max)
+    return qs, ts, q_goal, p_goal[0], dq
+
+
+def make_plan(node: Node, q_start, p_goal, R_goal, args, profile=None):
+    """Plan, time-parameterize, log and save. Returns (q, t, qd, qdd) or
+    None; qd/qdd are None on the trapezoidal fallback path.
+
+    profile: "lift" (lift -> horizontal transfer -> lower; the in-plane
+    move) or "straight" (one straight line start -> goal, no lift; the
+    plane-to-plane move). None = args.profile (default "lift").
+
+    Default timing (args.dwell >= 0): every straight segment (lift, transfer,
+    lower) is retimed on its own with zero velocity at both ends, so the arm
+    ramps down to a full stop at each corner, holds args.dwell seconds and
+    ramps up again. With a negative dwell the whole path is retimed in one go
+    (TOPP-RA) and the corners are rounded at speed."""
+    if profile is None:
+        profile = getattr(args, "profile", "lift")
+    lp.CANCEL.clear()
+    try:
+        plan = lp.plan_level_move_auto(
+            q_start, p_goal, R_goal, lift=args.lift, step=args.step,
+            profile=profile,
+            tcp_xyz=tuple(args.tcp_xyz), tcp_rpy=tuple(args.tcp_rpy))
+    except lp.PlanCancelled:
+        node.get_logger().warn("planning cancelled by the user")
+        print("planning cancelled — no plan")
+        return None
     if not plan["ok"]:
         node.get_logger().error("planning FAILED — see messages above")
         return None
-    retimed = lp.retime_toppra(plan["q"], plan["s"], v_max=args.v,
-                               a_max=args.a, qdot_max=args.qdot,
-                               qddot_max=args.qddot)
-    if retimed is not None:
-        t, q, qd, qdd = retimed
+    dwell = float(getattr(args, "dwell", 0.1))
+    if dwell >= 0.0:
+        t, q, qd, qdd, all_toppra = lp.retime_corner_stops(
+            plan["q"], plan["s"], plan["s_corners"], dwell=dwell,
+            v_max=args.v, a_max=args.a, qdot_max=args.qdot,
+            qddot_max=args.qddot)
+        n_stop = len(lp.corner_indices(plan["s"], plan["s_corners"]))
+        if not all_toppra:
+            node.get_logger().warn(
+                "toppra unavailable/failed — trapezoidal timing")
+        timing = (f"{'toppra' if all_toppra else 'trapezoidal'} per segment, "
+                  f"{n_stop} corner stop(s) of {dwell:.2f} s, max joint rate "
+                  f"{np.abs(qd).max():.2f} rad/s")
+    else:
+        retimed = lp.retime_toppra(plan["q"], plan["s"], v_max=args.v,
+                                   a_max=args.a, qdot_max=args.qdot,
+                                   qddot_max=args.qddot)
+        if retimed is not None:
+            t, q, qd, qdd = retimed
+            timing = f"toppra, max joint rate {np.abs(qd).max():.2f} rad/s"
+        else:
+            node.get_logger().warn(
+                "toppra unavailable/failed — trapezoidal timing")
+            q = plan["q"]
+            t = lp.time_parameterize(plan["s"], q, v_max=args.v,
+                                     a_max=args.a, qdot_max=args.qdot)
+            qd = qdd = None
+            timing = "trapezoidal"
+    if len(q) != len(plan["q"]):
         # verify the resampled spline still keeps the container level
         R_t, t_t = lp.tcp_transform(args.tcp_xyz, args.tcp_rpy)
         R, _, _, _ = lp.fk_tcp(q, R_t, t_t)
         a_up = R[0].T @ lp.UP
         tilt = np.arccos(np.clip(
             np.einsum("nij,j->ni", R, a_up) @ lp.UP, -1.0, 1.0))
-        timing = (f"toppra, max joint rate "
-                  f"{np.abs(qd).max():.2f} rad/s, sampled-path tilt "
-                  f"{np.rad2deg(tilt.max()):.3f} deg")
+        timing += f", sampled-path tilt {np.rad2deg(tilt.max()):.3f} deg"
+    if profile == "straight":
+        b = plan.get("bulge", 0.0)
+        shape = ("straight line start->goal (no lift)" if abs(b) < 1e-6 else
+                 f"arc start->goal, sagitta {abs(b):.2f} m toward "
+                 f"{lp._dir_label(b, plan.get('bulge_dir', 'side'))} (no lift)")
     else:
-        node.get_logger().warn("toppra unavailable/failed — trapezoidal timing")
-        q = plan["q"]
-        t = lp.time_parameterize(plan["s"], q, v_max=args.v,
-                                 a_max=args.a, qdot_max=args.qdot)
-        qd = qdd = None
-        timing = "trapezoidal"
+        shape = (("straight transfer" if abs(plan.get("bulge", 0.0)) < 1e-6
+                  else f"arc transfer, sagitta {plan['bulge']:+.2f} m")
+                 + f", lift {plan['lift']:.3f} m")
     node.get_logger().info(
-        f"plan: {len(plan['q'])} waypoints, {t[-1]:.1f} s ({timing}), lift "
-        f"{plan['lift']:.3f} m, max tilt "
+        f"plan: {len(plan['q'])} waypoints, {t[-1]:.1f} s ({timing}), "
+        f"{shape}, max tilt "
         f"{np.rad2deg(max(plan['tilt_err'].max(), plan['tilt_mid'].max())):.3f} deg")
     os.makedirs(OUT, exist_ok=True)
-    np.savez_compressed(args.save, q=q, t=t,
+    np.savez_compressed(args.save, q=q, t=t, bulge=plan.get("bulge", 0.0),
+                        bulge_dir=str(plan.get("bulge_dir", "side")),
+                        profile=profile,
                         q_wp=plan["q"], s_wp=plan["s"], p_ref=plan["p_ref"],
                         yaw_ref=plan["yaw_ref"], tilt=plan["tilt_err"])
     node.get_logger().info(f"saved {args.save}")
@@ -225,7 +324,8 @@ def make_plan(node: Node, q_start, p_goal, R_goal, args):
 INTERACTIVE_HELP = """\
 goal (plans from the CURRENT joint state, container kept level):
   x y z                  keep the current yaw          e.g.  -0.31 -0.15 0.55
-  x y z yaw              yaw change vs current [deg]   e.g.  -0.31 -0.15 0.55 45
+  x y z yaw              absolute yaw [deg], 0 = straight-ahead (+z) pose
+                                                       e.g.  -0.31 -0.15 0.55 45
   x y z qx qy qz qw      explicit orientation (base_link, xyzw)
 commands:
   where                  print the current TCP pose
@@ -233,7 +333,14 @@ commands:
                          NOT level-constrained; do this before grabbing
   preview  (p)           show the last plan in RViz (Planned Path display)
   exec     (go)          execute the last plan on the robot (asks first)
-  set NAME VALUE         tune lift/step/v/a/qdot/qddot e.g.  set lift 0.1
+  set NAME VALUE         tune lift/step/v/a/qdot/qddot/dwell e.g. set lift 0.1
+                         (dwell = hold at each corner [s]; set dwell -1 to
+                         run through the corners without stopping)
+  profile [lift|straight]
+                         path shape for the next goals: lift = lift ->
+                         horizontal transfer -> lower (in-plane move),
+                         straight = one straight line start -> goal, no lift
+                         (plane-to-plane move; keep y z = purely vertical)
   help     (?)           show this text
   quit     (q)           leave"""
 
@@ -266,6 +373,7 @@ def interactive(node: Node, args):
                 continue
             R, p, _, _ = lp.fk_tcp(qj[None], R_t, t_t)
             print(f"tcp pos: {np.round(p[0], 4).tolist()}  "
+                  f"yaw {np.rad2deg(lp.abs_yaw(R[0])):+.1f} deg  "
                   f"quat(xyzw): {np.round(lp.mat_to_quat(R[0]), 4).tolist()}")
             continue
         if cmd == "carry":
@@ -302,14 +410,24 @@ def interactive(node: Node, args):
             continue
         if cmd == "set" and len(toks) == 3:
             name = toks[1].lower()
-            if name not in ("lift", "step", "v", "a", "qdot", "qddot"):
-                print("set takes: lift step v a qdot qddot")
+            if name not in ("lift", "step", "v", "a", "qdot", "qddot",
+                            "dwell"):
+                print("set takes: lift step v a qdot qddot dwell")
                 continue
             try:
                 setattr(args, name, float(toks[2]))
                 print(f"{name} = {getattr(args, name)}")
             except ValueError:
                 print(f"not a number: {toks[2]}")
+            continue
+        if cmd == "profile":
+            if len(toks) == 1:
+                print(f"profile = {args.profile}")
+            elif len(toks) == 2 and toks[1].lower() in lp.PROFILES:
+                args.profile = toks[1].lower()
+                print(f"profile = {args.profile}")
+            else:
+                print(f"profile takes one of {' | '.join(lp.PROFILES)}")
             continue
         if cmd in ("p", "preview"):
             if last is None:
@@ -353,7 +471,7 @@ def interactive(node: Node, args):
             R_goal = lp.quat_to_mat(vals[3:])
         elif len(vals) == 4:
             R_cur, _, _, _ = lp.fk_tcp(q_start[None], R_t, t_t)
-            R_goal = lp.rot_axis(lp.UP, np.deg2rad(vals[3])) @ R_cur[0]
+            R_goal = lp.orientation_at_yaw(R_cur[0], np.deg2rad(vals[3]))
         else:
             R_goal = None
         last = make_plan(node, q_start, p_goal, R_goal, args)
@@ -366,12 +484,18 @@ def main():
                     metavar="V", help="x y z [qx qy qz qw] in base_link; "
                     "omit to enter the interactive prompt")
     ap.add_argument("--goal-yaw", type=float, default=None,
-                    help="goal yaw change vs start [deg, about world up]; "
+                    help="absolute goal yaw [deg about world up; 0 = the "
+                         "straight-ahead +z pose orientation]; "
                          "ignored if --goal has a quaternion")
     ap.add_argument("--start", type=float, nargs=7, default=None,
                     metavar="V", help="x y z qx qy qz qw — plan offline from "
                     "this pose instead of the current joint state")
     ap.add_argument("--lift", type=float, default=0.08)
+    ap.add_argument("--profile", choices=lp.PROFILES, default="lift",
+                    help="path shape: lift = lift -> horizontal transfer -> "
+                         "lower (in-plane move, default); straight = one "
+                         "straight line start -> goal with no lift (plane-"
+                         "to-plane move; same y z = purely vertical)")
     ap.add_argument("--step", type=float, default=0.005)
     ap.add_argument("--v", type=float, default=0.06, help="max speed [m/s]")
     ap.add_argument("--a", type=float, default=0.2, help="max accel [m/s^2]")
@@ -379,6 +503,10 @@ def main():
                     help="max joint rate [rad/s]")
     ap.add_argument("--qddot", type=float, default=3.0,
                     help="max joint acceleration [rad/s^2] (toppra timing)")
+    ap.add_argument("--dwell", type=float, default=0.1,
+                    help="hold time at each path corner [s] (default 0.1); "
+                         "negative = run through the corners without "
+                         "stopping (single TOPP-RA pass)")
     ap.add_argument("--tcp-xyz", type=float, nargs=3, default=(0, 0, 0))
     ap.add_argument("--tcp-rpy", type=float, nargs=3, default=(0, 0, 0))
     ap.add_argument("--real", action="store_true",
@@ -447,7 +575,7 @@ def main():
     elif args.goal_yaw is not None:
         R_cur, _, _, _ = lp.fk_tcp(q_start[None],
                                    *lp.tcp_transform(args.tcp_xyz, args.tcp_rpy))
-        R_goal = lp.rot_axis(lp.UP, np.deg2rad(args.goal_yaw)) @ R_cur[0]
+        R_goal = lp.orientation_at_yaw(R_cur[0], np.deg2rad(args.goal_yaw))
     else:
         R_goal = None      # keep the start orientation
 
