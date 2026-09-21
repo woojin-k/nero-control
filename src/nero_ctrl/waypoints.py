@@ -20,6 +20,11 @@ JSON layout (units are explicit in the keys):
       "joints_deg": [157.54, -101.65, ...] // 7 values; may be null
     }
 
+Writers may add optional provenance keys (all read with .get(), so older files
+stay valid): "frame" of the cartesian pose, "rpy_convention", the "source" that
+saved it, and the "tcp_offset" the pose was measured with. jog_gui.py's
+"저장된 자세" panel writes these; the direct-CAN capture() does not.
+
 Reading the current posture (read_pose / read_joints) does NOT enable motors or
 move the arm, so capture() is safe to run freely.
 
@@ -32,9 +37,9 @@ import json
 import math
 import os
 
-# Sibling reading helpers (both take an already-connected robot).
-import show_pose as sp
-import show_joints as sj
+# The robot-reading helpers (show_pose / show_joints) are imported lazily inside
+# capture(), because they pull in pyAgxArm: everything else here is pure JSON, so
+# a ROS-side GUI can save / load waypoints without the direct-CAN stack.
 
 # src/data/waypoints/ — next to the package, independent of the caller's cwd.
 _SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -101,17 +106,25 @@ def joints_deg_manual(vals):
     return [round(float(v), 4) for v in vals]
 
 
-def make_waypoint(name, description="", cartesian=None, joints_deg=None):
-    """Build a waypoint record. At least one of cartesian/joints_deg is required."""
+def make_waypoint(name, description="", cartesian=None, joints_deg=None,
+                  extra=None):
+    """Build a waypoint record. At least one of cartesian/joints_deg is required.
+
+    `extra` merges additional keys (provenance: frame, source, tcp_offset, ...)
+    into the record. Readers use .get(), so extra keys are always optional.
+    """
     if cartesian is None and joints_deg is None:
         raise ValueError("a waypoint needs a cartesian pose, joints, or both")
-    return {
+    rec = {
         "name": name,
         "description": description,
         "saved_at": _now(),
         "cartesian": cartesian,
         "joints_deg": joints_deg,
     }
+    if extra:
+        rec.update(extra)
+    return rec
 
 
 def save_waypoint(waypoint, directory=WAYPOINTS_DIR, overwrite=True):
@@ -143,6 +156,9 @@ def capture(robot, name, description="", cartesian=True, joints=True,
     (path, existed, waypoint). Raises ValueError if a requested part is
     unavailable (so the caller can report it).
     """
+    import show_pose as sp
+    import show_joints as sj
+
     err = check_name(name)
     if err:
         raise ValueError(err)
@@ -171,6 +187,19 @@ def load_waypoint(name, directory=WAYPOINTS_DIR):
     path = waypoint_path(name, directory)
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def delete_waypoint(name, directory=WAYPOINTS_DIR):
+    """Delete a saved waypoint's JSON file. Returns the path removed.
+
+    Raises FileNotFoundError if there is no such waypoint.
+    """
+    err = check_name(name)
+    if err:
+        raise ValueError(err)
+    path = waypoint_path(name, directory)
+    os.remove(path)
+    return path
 
 
 def list_waypoints(directory=WAYPOINTS_DIR):

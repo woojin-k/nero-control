@@ -227,6 +227,9 @@ src/data/waypoints/*
 !src/data/sequences/
 src/data/sequences/*
 !src/data/sequences/.gitkeep
+!src/data/paths/
+src/data/paths/*
+!src/data/paths/.gitkeep
 
 # orientation_constrained_nero_ctrl: generated outputs and colcon artifacts
 src/orientation_constrained_nero_ctrl/out/
@@ -236,3 +239,6 @@ src/orientation_constrained_nero_ctrl/ros2_ws/log/
 src/orientation_constrained_nero_ctrl/third_party/agx_arm_ros/build/
 src/orientation_constrained_nero_ctrl/third_party/agx_arm_ros/install/
 src/orientation_constrained_nero_ctrl/third_party/agx_arm_ros/log/
+
+# angle_control: generated plans
+src/angle_control/out/
