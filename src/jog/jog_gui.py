@@ -26,6 +26,15 @@ command stay visible whichever tab is open. 활성화 / 프리뷰만 are on the 
 tab and govern every red button in the window, the 경로 tab included.
 
   [조그]
+  손으로 옮기기 (REAL only) 리더로 = close the driver's control gate, then
+               put the arm in LEADER (zero-force drag) to move it by hand;
+               the pose display follows feedback/leader_joint_states and every
+               red button is locked. 팔로워로 복귀 = back to FOLLOWER, drive
+               the ros2_control mock to the arm's new pose (gate still closed,
+               the arm does not move), and only then reopen the gate — so the
+               jog continues from where the hand left the arm instead of the
+               arm snapping back. Mode frames go over our own pyAgxArm link
+               (--can / --fw), via nero_ctrl/mode_control.
   현재 TCP     live position [m], roll/pitch/yaw [deg] (base_link, URDF
                R = Rz·Ry·Rx — the convention show_pose.py prints) and joints
   조그         활성화 = unlock the red buttons (asks once — the arm moves on
@@ -33,9 +42,18 @@ tab and govern every red button in the window, the 경로 tab included.
                Planned Path display instead of executing (works locked);
                step size radios; the ± buttons per axis
   목표 자세    type an absolute pose and go there in one straight line
-  저장된 자세   name + save the live posture as src/data/waypoints/<name>.json
-               (the same format save_waypoint.py / goto_waypoint.py use, so a
-               pose taught here is replayable from the CLI and vice versa);
+  관절         the seven joints directly: ± jogs ONE joint by the step (no IK,
+               so it still moves where plan_line gives up — near a singularity
+               or at the all-zero home corner), the 목표 [°] entries are a
+               typed joint target to drive to, and the same entries are what
+               관절값 저장 stores. 모든 관절 0° drives all seven to zero
+               (warns first). The TCP does not travel in a line here.
+  저장된 자세   name + save a posture as src/data/waypoints/<name>.json — 현재
+               자세 저장 takes the live one, 관절값 저장 takes the 관절 panel's
+               typed target without moving the arm (its cartesian block is that
+               joint config's FK, so both fields of the file keep describing one
+               posture). Same format as save_waypoint.py / goto_waypoint.py, so
+               a pose taught here is replayable from the CLI and vice versa;
                a selected one can be loaded into 목표 자세, driven to in a
                straight line, replayed in joint space, or deleted
   그리퍼       live status, 열기 / 닫기 (gripper_controller, as level_gui_2)
@@ -84,6 +102,7 @@ for _d in (_HERE, _LEVEL_DIR, _CTRL_DIR):
 import jog_path as jp  # noqa: E402
 import level_path as lp  # noqa: E402
 import move_level as ml  # noqa: E402
+import nero_kinematics as nk  # noqa: E402  (URDF joint limits)
 import waypoints as wp  # noqa: E402  (saved poses, src/data/waypoints/*.json)
 import paths as pp  # noqa: E402  (solved paths, src/data/paths/*.json)
 import path_tab as pt  # noqa: E402  (the 경로 tab: editor + runner)
@@ -97,6 +116,7 @@ from rclpy.node import Node  # noqa: E402
 from rclpy.action import ActionClient  # noqa: E402
 from control_msgs.action import FollowJointTrajectory  # noqa: E402
 from sensor_msgs.msg import JointState  # noqa: E402
+from std_srvs.srv import SetBool  # noqa: E402
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint  # noqa: E402
 
 POLL_MS = 1000
@@ -106,6 +126,23 @@ DANGER_ACTIVE = "#8e0000"
 PARAMS = ("v", "w", "a", "qdot", "qddot", "step", "ang_step")
 POS_STEPS_MM = (1.0, 5.0, 10.0, 50.0)
 ROT_STEPS_DEG = (1.0, 5.0, 15.0, 45.0)
+JNT_STEPS_DEG = (1.0, 5.0, 15.0, 45.0)
+JOINT_LIMITS_DEG = np.rad2deg(nk.JOINT_LIMITS)   # (7, 2) from the URDF
+NJ = len(JOINT_LIMITS_DEG)
+# The arm reads back a hair outside its soft limits, so a typed joint value
+# within this much of a limit is clamped onto it instead of being refused —
+# otherwise 현재 값 채우기 followed by 이동 (관절) could reject its own reading.
+LIM_GRACE_DEG = 1.0
+# 손으로 옮기기 (REAL): the arm goes LEADER (zero-force drag) for the big move,
+# then back to FOLLOWER for the fine jog. The driver streams the ros2_control
+# mock's command (MOCK_TOPIC) to the arm, so its gate (GATE_SRV) is closed
+# while the arm is hand-guided and the mock is driven to the arm's new pose
+# (ARM_ACTION) before the gate reopens — otherwise the arm would snap back.
+LEADER_TOPIC = "feedback/leader_joint_states"   # the arm's joints while LEADER
+MOCK_TOPIC = "control/joint_states"
+ARM_ACTION = "arm_controller/follow_joint_trajectory"
+GATE_SRV = "control_enable"
+SYNC_TOL_DEG = 0.5
 POS_LABEL = {"x": "X  위(+) / 아래(−)", "y": "Y", "z": "Z"}
 ROT_LABEL = {"x": "Rx  수직축 회전 (yaw)", "y": "Ry  Y축 기울임",
              "z": "Rz  Z축 기울임"}
@@ -180,6 +217,13 @@ class JogGui:
         self._grip = None           # latest gripper status: (dict, wall time)
         self._grip_lock = threading.Lock()
         self._grip_client = None
+        self._danger_buttons = set()  # red ones: also locked while hand-guiding
+        self._leader = False        # arm is LEADER (hand-guided)
+        self._gate_closed = False   # we closed the driver's control gate
+        self._can_robot = None      # own pyAgxArm link, for the mode frames
+        self._mc = None             # nero_ctrl/mode_control, loaded with it
+        self._arm_client = None
+        self._gate_client = None
         if args.real:
             if lg.GripperStatus is not None:
                 node.create_subscription(lg.GripperStatus, lg.GRIP_STATUS_TOPIC,
@@ -203,6 +247,7 @@ class JogGui:
             b = tk.Button(parent, text=text, command=command, bg=DANGER_BG,
                           fg="white", activebackground=DANGER_ACTIVE,
                           activeforeground="white", **kw)
+            self._danger_buttons.add(b)
         else:
             b = ttk.Button(parent, text=text, command=command, **kw)
         (self._jog_buttons if jog else self._buttons).append(b)
@@ -242,6 +287,10 @@ class JogGui:
         self._btn(cur, "갱신",
                   lambda: self.worker.submit(self._job_poll, silent=True)
                   ).pack(side="right", padx=6, pady=2)
+
+        # --- hand guide (REAL only: sim has no leader mode)
+        if a.real:
+            self._build_hand(left, pad)
 
         # --- jog
         jf = ttk.LabelFrame(left, text="조그 (클릭 1회 = 스텝 1회 이동)")
@@ -336,6 +385,9 @@ class JogGui:
         ttk.Label(row, text="(조그와 같은 활성화/프리뷰 설정을 따름)",
                   foreground="#555").pack(side="left", padx=8)
 
+        # --- joint space
+        self._build_joints(left, pad)
+
         # --- gripper
         rec = lg.gr.load_range(mode="width")
         if rec is None:
@@ -398,6 +450,30 @@ class JogGui:
         self.path_tab.refresh()
         self._update_buttons()
 
+    def _build_hand(self, parent, pad):
+        """손으로 옮기기 panel: LEADER for the big move, FOLLOWER to jog."""
+        hf = ttk.LabelFrame(parent, text="손으로 옮기기 (리더 ↔ 팔로워)")
+        hf.pack(fill="x", **pad)
+        row = ttk.Frame(hf)
+        row.pack(fill="x", padx=6, pady=3)
+        kw = dict(bg=DANGER_BG, fg="white", activebackground=DANGER_ACTIVE,
+                  activeforeground="white")
+        self.to_leader_btn = tk.Button(row, text="리더로 (손으로 이동)",
+                                       command=self._do_to_leader, **kw)
+        self.to_leader_btn.pack(side="left", padx=2)
+        self.to_follower_btn = tk.Button(row, text="팔로워로 복귀 (조그)",
+                                         command=self._do_to_follower, **kw)
+        self.to_follower_btn.pack(side="left", padx=2)
+        self.hand_var = tk.StringVar()
+        ttk.Label(row, textvariable=self.hand_var,
+                  font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=10)
+        ttk.Label(hf, text="리더 = 브레이크가 풀려 손으로 움직임 (중력에 처질 수 "
+                           "있음) · 그동안 빨간 버튼은 잠김 · 복귀하면 그 자리에 "
+                           "멈추고 조그가 거기서 이어집니다",
+                  foreground="#555", wraplength=560, justify="left"
+                  ).pack(anchor="w", padx=6, pady=(0, 3))
+        self._show_hand()
+
     def _build_waypoints(self, parent, pad):
         """저장된 자세 panel: save the live posture, list / inspect / replay."""
         wf = ttk.LabelFrame(parent, text="저장된 자세 (src/data/waypoints/*.json)")
@@ -414,6 +490,7 @@ class JogGui:
         ttk.Entry(row, textvariable=self.wp_desc, width=24).pack(
             side="left", padx=(2, 8), fill="x", expand=True)
         self._btn(row, "현재 자세 저장", self._do_save_wp).pack(side="left", padx=2)
+        self._btn(row, "관절값 저장", self._do_save_joints).pack(side="left", padx=2)
 
         lrow = ttk.Frame(wf)
         lrow.pack(fill="x", padx=6, pady=2)
@@ -442,10 +519,78 @@ class JogGui:
         self._btn(row, "새로고침", self._wp_refresh).pack(side="right", padx=2)
         self._btn(row, "삭제", self._do_delete_wp).pack(side="right", padx=2)
         ttk.Label(wf, text="직선 = TCP 직선 보간 (IK 필요) · 관절 = 저장된 관절각으로 "
-                           "보간 (IK 없이 확실하지만 경로는 직선이 아님)",
+                           "보간 (IK 없이 확실하지만 경로는 직선이 아님) · "
+                           "관절값 저장 = 관절 패널의 목표 칸을 FK로 풀어 저장 "
+                           "(팔은 움직이지 않음)",
                   foreground="#555", wraplength=580, justify="left"
                   ).pack(anchor="w", padx=6, pady=(0, 3))
         self._wp_cache = {}
+
+    def _build_joints(self, parent, pad):
+        """관절 panel: per-joint jog, a typed joint target, save-by-joints."""
+        jnf = ttk.LabelFrame(parent, text="관절 (IK 없음 · TCP는 직선으로 가지 "
+                                          "않음)")
+        jnf.pack(fill="x", **pad)
+
+        srow = ttk.Frame(jnf)
+        srow.pack(fill="x", padx=6, pady=(3, 0))
+        ttk.Label(srow, text="관절 스텝 [°]").pack(side="left")
+        self.jnt_step = tk.StringVar(value=f"{JNT_STEPS_DEG[1]:g}")
+        for s in JNT_STEPS_DEG:
+            ttk.Radiobutton(srow, text=f"{s:g}", value=f"{s:g}",
+                            variable=self.jnt_step).pack(side="left", padx=2)
+        ttk.Radiobutton(srow, text="직접", value="custom",
+                        variable=self.jnt_step).pack(side="left", padx=(6, 0))
+        self.jnt_custom = tk.StringVar(value="10")
+        ttk.Entry(srow, textvariable=self.jnt_custom, width=6).pack(side="left")
+
+        # Two blocks side by side (J1-J4 | J5-J7), like the 위치 / 회전 pair
+        # above: seven stacked rows would push the 로그 pane off the window.
+        grid = ttk.Frame(jnf)
+        grid.pack(fill="x", padx=6, pady=4)
+        per_block = (NJ + 1) // 2
+        self.jnt_vars = []
+        for block in (0, 1):
+            c0 = block * 6
+            ttk.Label(grid, text="목표 [°]").grid(row=0, column=c0 + 1,
+                                                pady=(0, 2))
+            ttk.Label(grid, text="조그").grid(row=0, column=c0 + 2,
+                                            columnspan=2, pady=(0, 2))
+            ttk.Label(grid, text="한계 [°]", foreground="#555").grid(
+                row=0, column=c0 + 4, sticky="w", padx=(8, 0), pady=(0, 2))
+        for i in range(NJ):
+            block, r = divmod(i, per_block)
+            c0 = block * 6
+            ttk.Label(grid, text=f"J{i + 1}").grid(
+                row=1 + r, column=c0, sticky="w",
+                padx=((24, 6) if block else (0, 6)))
+            v = tk.StringVar()
+            self.jnt_vars.append(v)
+            ttk.Entry(grid, textvariable=v, width=8).grid(
+                row=1 + r, column=c0 + 1, padx=2, pady=1)
+            self._btn(grid, "−", lambda i=i: self._do_joint_jog(i, -1),
+                      danger=True, jog=True, width=4).grid(
+                row=1 + r, column=c0 + 2, padx=2, pady=1)
+            self._btn(grid, "+", lambda i=i: self._do_joint_jog(i, +1),
+                      danger=True, jog=True, width=4).grid(
+                row=1 + r, column=c0 + 3, padx=2, pady=1)
+            lo, hi = JOINT_LIMITS_DEG[i]
+            ttk.Label(grid, text=f"{lo:+.0f} ~ {hi:+.0f}", foreground="#555"
+                      ).grid(row=1 + r, column=c0 + 4, sticky="w", padx=(8, 0))
+
+        row = ttk.Frame(jnf)
+        row.pack(fill="x", padx=6, pady=(0, 4))
+        self._btn(row, "현재 값 채우기", self._fill_current_joints).pack(
+            side="left", padx=2)
+        self._btn(row, "이동 (관절)", self._do_joint_goto, danger=True, jog=True
+                  ).pack(side="left", padx=(12, 2))
+        self._btn(row, "모든 관절 0°", self._do_joint_zero, danger=True,
+                  jog=True).pack(side="left", padx=2)
+        ttk.Label(jnf, text="± = 그 관절만 스텝만큼 즉시 이동 (한계에서 잘림) · "
+                            "목표 칸은 '이동 (관절)'과 오른쪽 '관절값 저장'이 "
+                            "함께 씁니다",
+                  foreground="#555", wraplength=560, justify="left"
+                  ).pack(anchor="w", padx=6, pady=(0, 3))
 
     def _fit_window(self):
         self.root.update_idletasks()
@@ -456,13 +601,24 @@ class JogGui:
 
     # ------------------------------------------------------------ helpers
     def _update_buttons(self):
-        state = "disabled" if self._busy else "normal"
+        blocked = self._hand_blocked()
         for b in self._buttons:
-            b.configure(state=state)
-        jog_ok = (not self._busy
+            off = self._busy or (blocked and b in self._danger_buttons)
+            b.configure(state="disabled" if off else "normal")
+        jog_ok = (not self._busy and not blocked
                   and (self.arm_var.get() or self.preview_var.get()))
         for b in self._jog_buttons:
             b.configure(state="normal" if jog_ok else "disabled")
+        if getattr(self, "to_leader_btn", None) is not None:
+            self.to_leader_btn.configure(
+                state="normal" if not self._busy and not blocked else "disabled")
+            self.to_follower_btn.configure(
+                state="normal" if not self._busy and blocked else "disabled")
+
+    def _hand_blocked(self):
+        """True while the arm is hand-guided or the driver gate is still
+        closed: nothing may be sent to the arm then."""
+        return self._leader or self._gate_closed
 
     def log_line(self, line):
         self.log.configure(state="normal")
@@ -487,9 +643,11 @@ class JogGui:
             raise ValueError("v, w, 경로점 간격은 0보다 커야 합니다")
 
     def _step_value(self, kind):
-        """Selected jog step: metres for 'pos', radians for 'rot'."""
+        """Selected jog step: metres for 'pos', radians for 'rot' / 'joint'."""
         if kind == "pos":
             sel, custom, unit = self.pos_step, self.pos_custom, "mm"
+        elif kind == "joint":
+            sel, custom, unit = self.jnt_step, self.jnt_custom, "°"
         else:
             sel, custom, unit = self.rot_step, self.rot_custom, "°"
         raw = sel.get()
@@ -540,6 +698,9 @@ class JogGui:
             self._sync_params()
         except ValueError as exc:
             self.log_line(f"!! {exc}")
+            return
+        if self._hand_blocked():
+            self.log_line("!! 리더/제어 차단 중 — 먼저 '팔로워로 복귀'")
             return
         a = self.args
         preview_only = bool(self.preview_var.get())
@@ -624,6 +785,87 @@ class JogGui:
             return
         R1, p1 = jp.pose_from_rpy(xyz, rpy)
         self._run_move("목표 자세 이동", lambda R0, p0: (R1, p1))
+
+    # ------------------------------------------------------- joint space
+    def _joint_entries(self):
+        """The 관절 panel's typed target as (degrees list, q [rad]).
+
+        Raises ValueError naming the joint when a value is outside its URDF
+        limit. Values within LIM_GRACE_DEG of a limit are clamped onto it and
+        the clamped value is what both the move and the save use, so the file
+        can never hold a joint config the arm is not allowed to reach."""
+        deg = [self._float(v, f"J{i + 1}")
+               for i, v in enumerate(self.jnt_vars)]
+        bad = []
+        for i, d in enumerate(deg):
+            lo, hi = JOINT_LIMITS_DEG[i]
+            if not lo - LIM_GRACE_DEG <= d <= hi + LIM_GRACE_DEG:
+                bad.append(f"J{i + 1} {d:+.2f}° (한계 {lo:+.1f} ~ {hi:+.1f})")
+            else:
+                deg[i] = min(max(d, lo), hi)
+        if bad:
+            raise ValueError("관절 한계 초과: " + ", ".join(bad))
+        return deg, np.deg2rad(deg)
+
+    def _fill_current_joints(self):
+        if self.last_state is None:
+            self.log_line("!! 현재 관절값을 아직 못 읽었습니다")
+            return
+        qj = self.last_state[2]
+        if len(qj) != NJ:
+            self.log_line(f"!! 관절 {len(qj)}개를 읽었습니다 — {NJ}개가 필요합니다")
+            return
+        for v, d in zip(self.jnt_vars, np.rad2deg(qj)):
+            v.set(f"{d:.2f}")
+
+    def _do_joint_jog(self, i, sign):
+        """One joint, one step, right now — built from the live joints inside
+        the worker, so the step is added to where the arm really is."""
+        try:
+            step = self._step_value("joint")
+        except ValueError as exc:
+            self.log_line(f"!! {exc}")
+            return
+        lo, hi = nk.JOINT_LIMITS[i]
+
+        def goal(qj):
+            q = qj.copy()
+            want = qj[i] + sign * step
+            q[i] = min(max(want, lo), hi)
+            if abs(q[i] - qj[i]) < 1e-5:
+                print(f"!! J{i + 1}이(가) 이미 한계입니다 "
+                      f"({np.rad2deg(lo):+.1f} ~ {np.rad2deg(hi):+.1f}°) — "
+                      "그 방향으로는 더 못 갑니다")
+                return None
+            if abs(q[i] - want) > 1e-9:
+                print(f"   J{i + 1} 한계에서 잘림: {np.rad2deg(want):+.2f}° → "
+                      f"{np.rad2deg(q[i]):+.2f}°")
+            return q
+
+        self._run_joint_move(
+            f"관절 조그 J{i + 1} {np.rad2deg(sign * step):+g}°", goal,
+            confirm=False)
+
+    def _do_joint_goto(self):
+        try:
+            _deg, q = self._joint_entries()
+        except ValueError as exc:
+            self.log_line(f"!! {exc}")
+            return
+        self._run_joint_move("관절 목표 이동", q)
+
+    def _do_joint_zero(self):
+        """All seven joints to 0 — the URDF zero, inside every joint's limit.
+        Always asks, with a warning on top of the usual joint-move question:
+        the move is large, and the all-zero pose is a singular workspace
+        corner where the TCP jog (plan_line) cannot start from."""
+        self._run_joint_move(
+            "모든 관절 0° 이동", np.zeros(NJ),
+            warn=("⚠ 경고: 모든 관절을 0°로 보냅니다.\n"
+                  "· 여러 관절이 한꺼번에 크게 돌 수 있습니다 — 팔 주변과 "
+                  "그리퍼에 잡은 물체를 확인하세요.\n"
+                  "· 0° 자세는 특이 자세라 거기서는 TCP 조그가 잘 안 됩니다 — "
+                  "이후 관절 조그로 먼저 빠져나오세요."))
 
     # ------------------------------------------------------- saved poses
     def _wp_line(self, name, rec):
@@ -711,31 +953,59 @@ class JogGui:
         self.wp_detail.set("\n".join(lines[:3]))
 
     def _do_save_wp(self):
-        name = self.wp_name.get().strip()
-        err = wp.check_name(name)
-        if err:
-            self.log_line(f"!! 이름 오류: {err} (공백/'/'/'..' 없이, 숫자로 시작 금지)")
+        if self._leader:
+            self.log_line("!! 리더 중에는 저장하지 않습니다 — '팔로워로 복귀' 후 "
+                          "저장하세요")
             return
         if self.last_state is None:
             self.log_line("!! 현재 TCP를 아직 못 읽었습니다 — 저장할 자세가 없습니다")
             return
         p, rpy, qj = self.last_state
+        self._store_wp(wp.cartesian_from_pose([*p, *rpy]),
+                       wp.joints_deg_from_rad(qj))
+
+    def _do_save_joints(self):
+        """Save the 관절 panel's typed target as a pose — no motion, no IK.
+
+        The cartesian block is that joint config's own FK, so the file's two
+        fields still describe one posture: pasting the live cartesian next to
+        typed joints would send 이동 (직선) and 이동 (관절) to different
+        places, and leaving it out would make the pose unusable for 목표란에
+        불러오기 and for a 경로 이동 스텝 (path_tab needs the cartesian)."""
+        try:
+            deg, q = self._joint_entries()
+        except ValueError as exc:
+            self.log_line(f"!! {exc}")
+            return
+        R, p = jp.pose_now(q, *self._tcp())
+        self._store_wp(wp.cartesian_from_pose([*p, *jp.rpy_of(R)]),
+                       wp.joints_deg_manual(deg), manual=True)
+
+    def _store_wp(self, cartesian, joints_deg, manual=False):
+        """Name-check, confirm an overwrite, write the file, re-select it.
+        `manual` only marks the source — a typed posture was never reached."""
+        name = self.wp_name.get().strip()
+        err = wp.check_name(name)
+        if err:
+            self.log_line(f"!! 이름 오류: {err} (공백/'/'/'..' 없이, 숫자로 시작 금지)")
+            return
         path = wp.waypoint_path(name)
         if os.path.exists(path) and not messagebox.askyesno(
                 "Nero — 덮어쓸까요?",
-                f"'{name}' 자세가 이미 있습니다.\n\n{path}\n\n현재 자세로 "
-                "덮어쓸까요?", parent=self.root):
+                f"'{name}' 자세가 이미 있습니다.\n\n{path}\n\n"
+                f"{'입력한 관절값' if manual else '현재 자세'}으로 덮어쓸까요?",
+                parent=self.root):
             self.log_line(f"'{name}' 저장 취소됨")
             return
         a = self.args
         rec = wp.make_waypoint(
             name, self.wp_desc.get().strip(),
-            cartesian=wp.cartesian_from_pose([*p, *rpy]),
-            joints_deg=wp.joints_deg_from_rad(qj),
+            cartesian=cartesian, joints_deg=joints_deg,
             extra={
                 "frame": "base_link",
                 "rpy_convention": "Rz*Ry*Rx",
-                "source": f"jog_gui {'real' if a.real else 'sim'}",
+                "source": (f"jog_gui {'manual ' if manual else ''}"
+                           f"{'real' if a.real else 'sim'}"),
                 "tcp_offset": {"xyz_m": [float(v) for v in a.tcp_xyz],
                                "rpy_rad": [float(v) for v in a.tcp_rpy]},
             })
@@ -806,14 +1076,21 @@ class JogGui:
         self._run_joint_move(f"자세 '{name}' 이동 (관절)",
                              np.asarray(wp.to_joints_rad(rec), float))
 
-    def _run_joint_move(self, what, q_goal):
-        """Joint-space interpolation from the live joints to q_goal. No IK, so it
-        reaches poses plan_line rejects — but the TCP path is not a line, which
-        is why this one always asks before it executes."""
+    def _run_joint_move(self, what, goal, confirm=True, warn=""):
+        """Joint-space interpolation from the live joints to `goal`: either a
+        (7,) target, or a callable qj -> target that may return None to abort
+        (the per-joint jog needs the live joints to build its target). No IK,
+        so it reaches poses plan_line rejects — but the TCP path is not a line,
+        which is why it asks before it executes unless `confirm` is False
+        (the per-joint ± jog: one small step on one joint, clicked often).
+        `warn` is extra text shown at the top of that question."""
         try:
             self._sync_params()
         except ValueError as exc:
             self.log_line(f"!! {exc}")
+            return
+        if self._hand_blocked():
+            self.log_line("!! 리더/제어 차단 중 — 먼저 '팔로워로 복귀'")
             return
         a = self.args
         preview_only = bool(self.preview_var.get())
@@ -826,8 +1103,12 @@ class JogGui:
             if qj is None:
                 return
             qj = np.asarray(qj, float)
+            q_goal = goal(qj) if callable(goal) else goal
+            if q_goal is None:
+                return
+            q_goal = np.asarray(q_goal, float)
             if q_goal.shape != qj.shape:
-                print(f"!! {what}: 저장된 관절 {q_goal.size}개 ≠ 현재 {qj.size}개")
+                print(f"!! {what}: 목표 관절 {q_goal.size}개 ≠ 현재 {qj.size}개")
                 return
             q, t, dq = ml._joint_interp(qj, q_goal, a.qdot)
             print(f"{what}: {len(q)} 경로점, {t[-1]:.2f}초, 최대 관절 변화 "
@@ -837,9 +1118,10 @@ class JogGui:
                 return
             if not ml.exec_allowed(self.node, a):
                 return
-            if not self._ask_from_worker(
+            if confirm and not self._ask_from_worker(
                     f"{'REAL 로봇' if a.real else '시뮬'}: {what}\n\n"
-                    f"관절 보간 {t[-1]:.2f}초, 최대 관절 변화 "
+                    + (f"{warn}\n\n" if warn else "")
+                    + f"관절 보간 {t[-1]:.2f}초, 최대 관절 변화 "
                     f"{np.rad2deg(dq):.1f}°.\nTCP는 직선으로 가지 않습니다 — "
                     "경로가 비어 있는지 확인하세요."):
                 print(f"{what} 취소됨")
@@ -1002,10 +1284,211 @@ class JogGui:
             last_w = w
         return ("timeout" if seen else "no_status"), self._grip_state()
 
+    # ------------------------------------------------ hand guide (REAL)
+    def _show_hand(self):
+        if getattr(self, "hand_var", None) is None:
+            return
+        if self._leader:
+            txt = "리더 — 손으로 이동 중 (빨간 버튼 잠김)"
+        elif self._gate_closed:
+            txt = "팔로워 — 제어 차단됨 ('팔로워로 복귀'로 재시도)"
+        else:
+            txt = "팔로워 — 조그 제어 중"
+        self.hand_var.set(txt)
+
+    def _set_hand(self, leader=None, gate_closed=None):
+        """Worker side: record the hand-guide state and refresh the UI."""
+        if leader is not None:
+            self._leader = leader
+        if gate_closed is not None:
+            self._gate_closed = gate_closed
+        self.ui_q.put(("hand",))
+
+    def _do_to_leader(self):
+        if not messagebox.askyesno(
+                "Nero — 리더 모드",
+                "⚠ 경고: 팔을 리더(무저항 드래그) 모드로 바꿉니다.\n\n"
+                "· 모터를 켜 브레이크를 푼 뒤 무저항이 됩니다 — 팔이 중력에 "
+                "처질 수 있으니 지금 팔을 손으로 받치세요.\n"
+                "· 리더 동안 조그·이동·그리퍼 버튼은 잠깁니다.\n"
+                "· 옮긴 뒤 '팔로워로 복귀'를 누르면 그 자리에 멈추고 조그로 "
+                "이어갑니다.\n\n팔을 받쳤습니까?", parent=self.root):
+            return
+        self.worker.submit(self._job_to_leader)
+
+    def _do_to_follower(self):
+        if self._leader and not messagebox.askyesno(
+                "Nero — 팔로워 복귀",
+                "팔을 팔로워로 되돌립니다.\n\n"
+                "· 팔이 지금 자리에서 힘을 받아 멈춥니다 — 전환 순간 살짝 "
+                "움직일 수 있으니 팔을 받친 채로 누르세요.\n"
+                "· 이어서 ROS 쪽 목표를 지금 자세로 맞춘 뒤 조그 제어를 다시 "
+                "엽니다.", parent=self.root):
+            return
+        self.worker.submit(self._job_to_follower)
+
+    def _job_to_leader(self):
+        robot = self._can_arm()
+        if robot is None:
+            return
+        # Gate first: the driver must stop streaming commands before the arm
+        # goes limp, or it keeps fighting the hand.
+        if not self._set_gate(False):
+            print("!! 드라이버 제어 차단 실패 — 리더로 바꾸지 않습니다")
+            return
+        self._set_hand(gate_closed=True)
+        ok, _before, after = self._mc.set_mode(robot, "leader",
+                                               confirm=lambda _m: True)
+        role = (after or {}).get("linkage_role")
+        if ok and role == "LEADER":
+            self._set_hand(leader=True)
+            print("리더 모드 — 팔을 손으로 옮기세요. 끝나면 '팔로워로 복귀'")
+            return
+        print(f"!! 리더 전환 실패 (현재 {role}) — 팔로워로 되돌립니다")
+        self._job_to_follower()
+
+    def _job_to_follower(self):
+        robot = self._can_arm()
+        if robot is None:
+            return
+        ok, _before, after = self._mc.set_mode(robot, "follower",
+                                               confirm=lambda _m: True)
+        role = (after or {}).get("linkage_role")
+        if not ok or role == "LEADER":
+            print(f"!! 팔로워 전환 실패 (현재 {role}) — 다시 누르세요")
+            return
+        self._set_hand(leader=False)
+        self._resume_control()
+
+    def _resume_control(self):
+        """Point the controller at the arm's real pose, then reopen the gate.
+
+        The driver streams the mock's command to the arm, and the mock still
+        holds the pose from before the hand move: reopening the gate as is
+        would drive the arm straight back there. With the gate still closed,
+        the mock is driven to the live pose (arm_controller, bypassing MoveIt,
+        whose start-state check would refuse a start that is not the arm's),
+        and the gate opens only once the two agree within SYNC_TOL_DEG."""
+        for _ in range(3):
+            q_real = self._fresh_joints()
+            if q_real is None:
+                print("!! 팔 관절 피드백이 들어오지 않습니다 — 제어 차단 유지. "
+                      "팔 상태를 확인하고 '팔로워로 복귀'를 다시 누르세요")
+                return False
+            q_mock = ml.read_current_joints(self.node, MOCK_TOPIC, timeout=2.0)
+            if q_mock is None:
+                print(f"!! '{MOCK_TOPIC}'을 못 읽음 — 제어 차단 유지")
+                return False
+            gap = float(np.rad2deg(np.abs(q_mock - q_real)).max())
+            if gap <= SYNC_TOL_DEG:
+                break
+            print(f"   컨트롤러 목표를 실제 자세로 맞추는 중 (최대 차이 {gap:.1f}°, "
+                  "팔은 안 움직임)")
+            if not self._drive_mock(q_mock, q_real):
+                print("!! 컨트롤러 목표 맞추기 실패 — 제어 차단 유지")
+                return False
+        else:
+            print(f"!! 컨트롤러 목표가 실제 자세와 {SYNC_TOL_DEG}° 안으로 안 맞음 "
+                  "— 제어 차단 유지")
+            return False
+        if not self._set_gate(True):
+            print("!! 드라이버 제어 열기 실패 — '팔로워로 복귀'를 다시 누르세요")
+            return False
+        self._set_hand(gate_closed=False)
+        print("팔로워 — 조그 제어 재개 (지금 자세에서 이어집니다)")
+        return True
+
+    def _can_arm(self):
+        """Our own pyAgxArm link (lazy, kept open): the mode frames go
+        straight to the arm, next to the driver's connection."""
+        if self._can_robot is not None:
+            return self._can_robot
+        try:
+            import connect_check as cc
+            import mode_control as mc
+        except ImportError as exc:
+            print(f"!! pyAgxArm / 모드 전환 모듈을 못 불러옴: {exc}")
+            return None
+        try:
+            robot, _ = cc.connect(self.args.can, self.args.fw)
+        except Exception as exc:  # noqa: BLE001
+            print(f"!! CAN '{self.args.can}' 연결 실패: "
+                  f"{type(exc).__name__}: {exc}")
+            return None
+        self._mc = mc
+        self._can_robot = robot
+        return robot
+
+    def _fresh_joints(self, timeout=3.0):
+        """The arm's joints from our CAN link, only once that feedback is
+        live — its timestamp advancing. A LEADER arm sends none, so a cached
+        pre-drag reading would sync the controller to the wrong pose."""
+        end = time.time() + timeout
+        first = None
+        while time.time() < end:
+            m = self._can_robot.get_joint_angles()
+            if m is not None:
+                if first is None:
+                    first = m.timestamp
+                elif m.timestamp > first:
+                    return np.asarray(list(m.msg)[:NJ], float)
+            time.sleep(0.1)
+        return None
+
+    def _set_gate(self, on):
+        """Open / close the driver's control gate (control_enable)."""
+        if self._gate_client is None:
+            self._gate_client = self.node.create_client(SetBool, GATE_SRV)
+        if not self._gate_client.wait_for_service(timeout_sec=2.0):
+            print(f"!! 드라이버 서비스 '{GATE_SRV}' 없음 — real.launch 실행 중?")
+            return False
+        req = SetBool.Request()
+        req.data = bool(on)
+        fut = self._gate_client.call_async(req)
+        rclpy.spin_until_future_complete(self.node, fut, timeout_sec=3.0)
+        res = fut.result()
+        if res is None or not res.success:
+            return False
+        print(f"   드라이버 제어 {'열림' if on else '차단'}")
+        return True
+
+    def _drive_mock(self, q_from, q_to):
+        """Move arm_controller (the mock) to q_to and wait. Gate closed, so
+        the arm itself does not move."""
+        if self._arm_client is None:
+            self._arm_client = ActionClient(self.node, FollowJointTrajectory,
+                                            ARM_ACTION)
+        if not self._arm_client.wait_for_server(timeout_sec=3.0):
+            print(f"!! '{ARM_ACTION}' 액션 서버 없음")
+            return False
+        _q, t, _dq = ml._joint_interp(q_from, q_to, self.args.qdot)
+        T = float(t[-1])
+        jt = JointTrajectory()
+        jt.joint_names = list(ml.JOINTS)
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(x) for x in q_to]
+        pt.velocities = [0.0] * NJ
+        pt.time_from_start.sec = int(T)
+        pt.time_from_start.nanosec = int((T % 1.0) * 1e9)
+        jt.points.append(pt)
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = jt
+        fut = self._arm_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self.node, fut, timeout_sec=3.0)
+        handle = fut.result()
+        if handle is None or not handle.accepted:
+            return False
+        res = handle.get_result_async()
+        rclpy.spin_until_future_complete(self.node, res, timeout_sec=T + 5.0)
+        return (res.done() and res.result() is not None
+                and res.result().result.error_code == 0)
+
     # --------------------------------------------------------------- poll
     def _job_poll(self):
-        qj = ml.read_current_joints(self.node, self.args.joint_states,
-                                    timeout=0.8)
+        # LEADER sends no normal feedback; the driver republishes the leader
+        # broadcast instead, so the pose still tracks the hand-guided arm.
+        topic = LEADER_TOPIC if self._leader else self.args.joint_states
+        qj = ml.read_current_joints(self.node, topic, timeout=0.8)
         end = time.time() + 0.3          # gripper status rides the same loop
         while time.time() < end:
             st = self._grip_state()
@@ -1014,8 +1497,7 @@ class JogGui:
             rclpy.spin_once(self.node, timeout_sec=0.05)
         self.ui_q.put(("grip", self._grip_state()))
         if qj is None:
-            self.ui_q.put(("state", self.node.count_publishers(
-                self.args.joint_states)))
+            self.ui_q.put(("state", self.node.count_publishers(topic)))
             return
         R_t, t_t = self._tcp()
         R, p = jp.pose_now(qj, R_t, t_t)
@@ -1060,6 +1542,9 @@ class JogGui:
                     self._show_state(item[1])
                 elif kind == "grip":
                     self._show_grip(item[1])
+                elif kind == "hand":
+                    self._show_hand()
+                    self._update_buttons()
                 elif kind == "pathsaved":
                     self.path_tab.adopt(item[1])
                 elif kind == "pathstatus":
@@ -1081,10 +1566,21 @@ class JogGui:
                 "Nero — 종료", "명령이 아직 실행 중입니다. 그래도 종료할까요?",
                 parent=self.root):
             return
+        if self._hand_blocked() and not messagebox.askyesno(
+                "Nero — 종료",
+                "⚠ 팔이 리더 모드이거나 드라이버 제어가 차단된 상태입니다.\n\n"
+                "이대로 종료하면 차단이 남아, 이후 MoveIt 명령은 시뮬 상태만 "
+                "움직이고 실제 팔은 안 움직입니다 — 나중에 제어가 열리면 팔이 "
+                "그 자리로 튈 수 있습니다.\n먼저 '팔로워로 복귀'를 누르는 것을 "
+                "권합니다.\n\n그래도 종료할까요?", parent=self.root):
+            return
         if getattr(self, "path_tab", None) is not None:
             self.path_tab._do_stop()      # cancel a running path before exiting
         self.worker.submit(None)
         self.worker.join(timeout=3.0)
+        if self._can_robot is not None:
+            with contextlib.suppress(Exception):
+                self._can_robot.disconnect()
         self.root.destroy()
 
 
@@ -1111,6 +1607,12 @@ def main():
                     help="waypoint spacing along the line [m]")
     ap.add_argument("--ang-step", type=float, default=2.0, dest="ang_step",
                     help="waypoint spacing in orientation [deg]")
+    ap.add_argument("--can", default="can0",
+                    help="CAN channel for the leader/follower switch (REAL)")
+    ap.add_argument("--fw", default="v112",
+                    choices=["default", "v111", "v112", "v120"],
+                    help="arm firmware parser for that switch (default v112; "
+                         "not auto — a LEADER arm answers no firmware query)")
     ap.add_argument("--grip-open", type=float, default=lg.GRIP_OPEN_DEFAULT,
                     help="'열기' 목표 폭 [m] (티칭 범위가 없을 때; 기본 0.1)")
     args = ap.parse_args()
